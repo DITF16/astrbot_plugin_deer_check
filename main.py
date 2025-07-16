@@ -19,7 +19,7 @@ DB_NAME = "deer_checkin.db"
     "astrbot_plugin_deer_check",
     "DITF16",
     "一个发送'🦌'表情进行打卡并生成月度日历的插件",
-    "1.0"
+    "1.1"
 )
 class DeerCheckinPlugin(Star):
     def __init__(self, context: Context):
@@ -120,6 +120,76 @@ class DeerCheckinPlugin(Star):
 
         async for result in self._generate_and_send_calendar(event):
             yield result
+
+    @filter.regex(r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$')
+    async def handle_retro_checkin(self, event: AstrMessageEvent):
+        """
+        处理补签命令，格式: '🦌补签 <日期> <次数>'
+        """
+        await self._ensure_initialized()
+
+        # 在函数内部，对消息原文进行正则搜索
+        pattern = r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$'
+        match = re.search(pattern, event.message_str)
+
+        if not match:
+            logger.error("补签处理器被触发，但内部正则匹配失败！这不应该发生。")
+            return
+
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+
+        # 从 match 对象中解析日期和次数
+        try:
+            day_str, count_str = match.groups()
+            day_to_checkin = int(day_str)
+            deer_count = int(count_str)
+            if deer_count <= 0:
+                yield event.plain_result("补签次数必须是大于0的整数哦！")
+                return
+        except (ValueError, TypeError):
+            yield event.plain_result("命令格式不正确，请使用：🦌补签 日期 次数 (例如：🦌补签 1 5)")
+            return
+
+        # 验证日期有效性
+        today = date.today()
+        current_year = today.year
+        current_month = today.month
+
+        days_in_month = calendar.monthrange(current_year, current_month)[1]
+
+        if not (1 <= day_to_checkin <= days_in_month):
+            yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
+            return
+
+        if day_to_checkin > today.day:
+            yield event.plain_result("抱歉，不能对未来进行补签哦！")
+            return
+
+        # 添加补签日期并更新数据库
+        target_date = date(current_year, current_month, day_to_checkin)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT INTO checkin (user_id, checkin_date, deer_count)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, checkin_date)
+                    DO UPDATE SET deer_count = deer_count + excluded.deer_count;
+                ''', (user_id, target_date_str, deer_count))
+                await conn.commit()
+            logger.info(f"用户 {user_name} ({user_id}) 成功为 {target_date_str} 补签了 {deer_count} 个🦌。")
+        except Exception as e:
+            logger.error(f"为用户 {user_name} ({user_id}) 补签失败: {e}")
+            yield event.plain_result("补签失败，数据库出错了 >_<")
+            return
+
+        # 发送成功提示，并返回更新后的日历图片
+        yield event.plain_result(f"补签成功！已为 {current_month}月{day_to_checkin}日 增加了 {deer_count} 个鹿。")
+        async for result in self._generate_and_send_calendar(event):
+            yield result
+
 
     def _create_calendar_image(self, user_id: str, user_name: str, year: int, month: int, checkin_data: dict, total_deer: int) -> str:
         """
