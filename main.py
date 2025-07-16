@@ -79,7 +79,7 @@ class DeerCheckinPlugin(Star):
         except Exception as e:
             logger.error(f"月度数据清理失败: {e}")
 
-    @filter.regex(r'^🦌+$', flags=re.IGNORECASE)
+    @filter.regex(r'^🦌+$')
     async def handle_deer_checkin(self, event: AstrMessageEvent):
         """处理鹿打卡事件：记录数据，然后发送日历。"""
         user_id = event.get_sender_id()
