@@ -19,7 +19,7 @@ DB_NAME = "deer_checkin.db"
     "astrbot_plugin_deer_check",
     "DITF16",
     "一个发送'🦌'表情进行打卡并生成月度日历的插件",
-    "1.1"
+    "1.2"
 )
 class DeerCheckinPlugin(Star):
     def __init__(self, context: Context):
@@ -190,6 +190,30 @@ class DeerCheckinPlugin(Star):
         async for result in self._generate_and_send_calendar(event):
             yield result
 
+    @filter.regex(r'^🦌帮助$')
+    async def handle_help_command(self, event: AstrMessageEvent):
+        """
+        响应 '🦌帮助' 命令，发送一个包含所有指令用法的菜单。
+        """
+        help_text = (
+            "--- 🦌打卡帮助菜单 ---\n\n"
+            "1️⃣  **🦌打卡**\n"
+            "    ▸ **命令**: 直接发送 🦌 (可发送多个)\n"
+            "    ▸ **作用**: 记录今天🦌的数量。\n"
+            "    ▸ **示例**: `🦌🦌🦌`\n\n"
+            "2️⃣  **查看记录**\n"
+            "    ▸ **命令**: `🦌日历`\n"
+            "    ▸ **作用**: 查看您本月的打卡日历，不记录打卡。\n\n"
+            "3️⃣  **补签**\n"
+            "    ▸ **命令**: `🦌补签 [日期] [次数]`\n"
+            "    ▸ **作用**: 为本月指定日期补上打卡记录。\n"
+            "    ▸ **示例**: `🦌补签 1 5` (为本月1号补签5次)\n\n"
+            "4️⃣  **显示此帮助**\n"
+            "    ▸ **命令**: `🦌帮助`\n\n"
+            "祝您一🦌顺畅！"
+        )
+
+        yield event.plain_result(help_text)
 
     def _create_calendar_image(self, user_id: str, user_name: str, year: int, month: int, checkin_data: dict, total_deer: int) -> str:
         """
