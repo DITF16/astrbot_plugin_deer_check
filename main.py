@@ -1,10 +1,11 @@
-import sqlite3
+import aiosqlite
 import calendar
 from datetime import date
 from PIL import Image, ImageDraw, ImageFont
 import os
 import re
 import time
+import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -31,16 +32,23 @@ class DeerCheckinPlugin(Star):
         self.font_path = os.path.join(resources_dir, FONT_FILE)
         self.temp_dir = os.path.join(plugin_dir, "tmp")
         os.makedirs(self.temp_dir, exist_ok=True)
-        self._init_db()
-        self._monthly_cleanup()
 
-    def _init_db(self):
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    async def _ensure_initialized(self):
+        """确保数据库和月度清理只在首次调用时异步执行一次"""
+        async with self._init_lock:
+            if not self._initialized:
+                await self._init_db()
+                await self._monthly_cleanup()
+                self._initialized = True
+
+    async def _init_db(self):
         """初始化数据库和表结构"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                # 创建打卡记录表
-                cursor.execute('''
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
                     CREATE TABLE IF NOT EXISTS checkin (
                         user_id TEXT NOT NULL,
                         checkin_date TEXT NOT NULL,
@@ -48,33 +56,30 @@ class DeerCheckinPlugin(Star):
                         PRIMARY KEY (user_id, checkin_date)
                     )
                 ''')
-                cursor.execute('''
+                await conn.execute('''
                     CREATE TABLE IF NOT EXISTS metadata (
                         key TEXT PRIMARY KEY,
                         value TEXT
                     )
                 ''')
-                conn.commit()
+                await conn.commit()
             logger.info("鹿打卡数据库初始化成功。")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
 
-    def _monthly_cleanup(self):
+    async def _monthly_cleanup(self):
         """检查是否进入新月份，如果是则清空旧数据"""
         current_month = date.today().strftime("%Y-%m")
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT value FROM metadata WHERE key = 'last_cleanup_month'")
-                last_cleanup = cursor.fetchone()
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute("SELECT value FROM metadata WHERE key = 'last_cleanup_month'")
+                last_cleanup = await cursor.fetchone()
 
                 if not last_cleanup or last_cleanup[0] != current_month:
-                    # 新的月份，执行清理
-                    cursor.execute("DELETE FROM checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
-                    # 更新清理记录
-                    cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-                                   ("last_cleanup_month", current_month))
-                    conn.commit()
+                    await conn.execute("DELETE FROM checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
+                    await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                                       ("last_cleanup_month", current_month))
+                    await conn.commit()
                     logger.info(f"已执行月度清理，现在是 {current_month}。")
         except Exception as e:
             logger.error(f"月度数据清理失败: {e}")
@@ -82,21 +87,21 @@ class DeerCheckinPlugin(Star):
     @filter.regex(r'^🦌+$')
     async def handle_deer_checkin(self, event: AstrMessageEvent):
         """处理鹿打卡事件：记录数据，然后发送日历。"""
+        await self._ensure_initialized()
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
         deer_count = event.message_str.count("🦌")
         today_str = date.today().strftime("%Y-%m-%d")
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
                     INSERT INTO checkin (user_id, checkin_date, deer_count)
                     VALUES (?, ?, ?)
                     ON CONFLICT(user_id, checkin_date)
                     DO UPDATE SET deer_count = deer_count + excluded.deer_count;
                 ''', (user_id, today_str, deer_count))
-                conn.commit()
+                await conn.commit()
             logger.info(f"用户 {user_name} ({user_id}) 打卡成功，记录了 {deer_count} 个🦌。")
         except Exception as e:
             logger.error(f"记录用户 {user_name} ({user_id}) 的打卡数据失败: {e}")
@@ -108,9 +113,8 @@ class DeerCheckinPlugin(Star):
 
     @filter.regex(r'^🦌日历$')
     async def handle_calendar_command(self, event: AstrMessageEvent):
-        """
-        '🦌日历' 命令，只查询并发送用户的当月打卡日历。
-        """
+        """'🦌日历' 命令，只查询并发送用户的当月打卡日历。"""
+        await self._ensure_initialized()
         user_name = event.get_sender_name()
         logger.info(f"用户 {user_name} ({event.get_sender_id()}) 使用命令查询日历。")
 
@@ -120,13 +124,6 @@ class DeerCheckinPlugin(Star):
     def _create_calendar_image(self, user_id: str, user_name: str, year: int, month: int, checkin_data: dict, total_deer: int) -> str:
         """
         绘制用户月度打卡日历图片
-
-        :param user_name: 用户名
-        :param year: 年份
-        :param month: 月份
-        :param checkin_data: {日期: 鹿数量} 的字典
-        :param total_deer: 当月总鹿数
-        :return: 图片的路径
         """
         WIDTH, HEIGHT = 700, 620
         BG_COLOR = (255, 255, 255)
@@ -159,7 +156,6 @@ class DeerCheckinPlugin(Star):
         for i, day in enumerate(weekdays):
             draw.text((i * cell_width + cell_width / 2, 90), day, font=font_weekday, fill=WEEKDAY_COLOR, anchor="mm")
 
-
         cal = calendar.monthcalendar(year, month)
         y_offset = 120
         cell_height = 75
@@ -169,7 +165,6 @@ class DeerCheckinPlugin(Star):
             for i, day_num in enumerate(week):
                 if day_num == 0:
                     continue
-
                 x_pos = i * cell_width
 
                 # 如果是今天，绘制一个淡蓝色背景
@@ -182,7 +177,6 @@ class DeerCheckinPlugin(Star):
                 # 绘制日期数字
                 draw.text((x_pos + cell_width - 10, y_offset + 5), str(day_num), font=font_day, fill=DAY_COLOR,
                           anchor="ra")
-
                 if day_num in checkin_data:
                     # 绘制 '√'
                     draw.text(
@@ -195,9 +189,7 @@ class DeerCheckinPlugin(Star):
                         (x_pos + cell_width / 2, y_offset + cell_height / 2 + 20),
                         deer_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
                     )
-
             y_offset += cell_height
-
 
         total_days = len(checkin_data)
         summary_text = f"本月总结：累计鹿了 {total_days} 天，共鹿 {total_deer} 次"
@@ -208,13 +200,9 @@ class DeerCheckinPlugin(Star):
         return file_path
 
     async def _generate_and_send_calendar(self, event: AstrMessageEvent):
-        """
-        查询和生成当月的打卡日历。
-        """
+        """查询和生成当月的打卡日历。"""
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
-
-        # 从数据库获取当月该用户的所有打卡记录
         current_year = date.today().year
         current_month = date.today().month
         current_month_str = date.today().strftime("%Y-%m")
@@ -222,31 +210,30 @@ class DeerCheckinPlugin(Star):
         checkin_records = {}
         total_deer_this_month = 0
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
                     "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
                     (user_id, current_month_str)
-                )
-                rows = cursor.fetchall()
-                if not rows:
-                    yield event.plain_result("您本月还没有打卡记录哦，发送“🦌”开始第一次打卡吧！")
-                    return
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result("您本月还没有打卡记录哦，发送“🦌”开始第一次打卡吧！")
+                        return
 
-                for row in rows:
-                    day = int(row[0].split('-')[2])
-                    count = row[1]
-                    checkin_records[day] = count
-                    total_deer_this_month += count
+                    for row in rows:
+                        day = int(row[0].split('-')[2])
+                        count = row[1]
+                        checkin_records[day] = count
+                        total_deer_this_month += count
         except Exception as e:
             logger.error(f"查询用户 {user_name} ({user_id}) 的月度数据失败: {e}")
             yield event.plain_result("查询日历数据时出错了 >_<")
             return
 
-        # 生成、发送并清理日历图片
         image_path = ""
         try:
-            image_path = self._create_calendar_image(
+            image_path = await asyncio.to_thread(
+                self._create_calendar_image,
                 user_id,
                 user_name,
                 current_year,
@@ -265,7 +252,7 @@ class DeerCheckinPlugin(Star):
         finally:
             if image_path and os.path.exists(image_path):
                 try:
-                    os.remove(image_path)
+                    await asyncio.to_thread(os.remove, image_path)
                     logger.debug(f"已成功删除临时图片: {image_path}")
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
