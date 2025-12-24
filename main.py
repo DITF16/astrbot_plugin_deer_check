@@ -458,6 +458,107 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
+    @filter.regex(r'^🦌月历\s+(\d{1,2})$')
+    async def handle_specific_month_calendar(self, event: AstrMessageEvent):
+        """
+        响应 '🦌月历 X' 命令，生成并发送指定月份的打卡日历图片。
+        """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        # 解析月份参数
+        import re
+        pattern = r'^🦌月历\s+(\d{1,2})$'
+        match = re.search(pattern, event.message_str)
+        if not match:
+            yield event.plain_result("命令格式错误，请使用：🦌月历 月份（如：🦌月历 11）")
+            return
+
+        try:
+            target_month = int(match.group(1))
+            if not (1 <= target_month <= 12):
+                yield event.plain_result("月份必须在1-12之间哦！")
+                return
+        except ValueError:
+            yield event.plain_result("请输入正确的月份数字！")
+            return
+
+        # 计算年份：如果指定月份大于当前月份，则为去年
+        current_date = datetime.now()
+        current_month = current_date.month
+        current_year = current_date.year
+
+        if target_month > current_month:
+            target_year = current_year - 1
+        else:
+            target_year = current_year
+
+        target_month_str = f"{target_year}-{target_month:02d}"
+        user_name = event.get_sender_name()
+
+        logger.info(f"用户 {user_name} ({user_id}) 请求查看 {target_year}年{target_month}月的日历。")
+
+        # 查询指定月份的打卡记录
+        checkin_records = {}
+        total_deer_this_month = 0
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    (user_id, target_month_str)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result(f"您在{target_year}年{target_month}月还没有打卡记录哦，发送“🦌”开始打卡吧！")
+                        return
+
+                    for row in rows:
+                        day = int(row[0].split('-')[2])
+                        count = row[1]
+                        checkin_records[day] = count
+                        total_deer_this_month += count
+        except Exception as e:
+            logger.error(f"查询用户 {user_name} ({user_id}) 的 {target_year}年{target_month}月数据失败: {e}")
+            yield event.plain_result("查询月历数据时出错了 >_<")
+            return
+
+        # 生成并发送日历图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self._create_calendar_image,
+                user_id,
+                user_name,
+                target_year,
+                target_month,
+                checkin_records,
+                total_deer_this_month
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成日历图片。")
+            yield event.plain_result(
+                f"服务器缺少字体文件，无法生成日历图片。{target_year}年{target_month}月您已打卡{len(checkin_records)}天，累计{total_deer_this_month}个🦌。")
+        except Exception as e:
+            logger.error(f"生成或发送日历图片失败: {e}")
+            yield event.plain_result("处理日历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌帮助$')
     async def handle_help_command(self, event: AstrMessageEvent):
         """
@@ -481,11 +582,15 @@ class DeerCheckinPlugin(Star):
             "2️⃣  **查看记录**\n"
             "    ▸ **命令**: `🦌日历`\n"
             "    ▸ **作用**: 查看您本月的打卡日历，不记录打卡。\n\n"
-            "3️⃣  **补签**\n"
+            "3️⃣  **查看指定月份记录**\n"
+            "    ▸ **命令**: `🦌月历 月份数字`\n"
+            "    ▸ **作用**: 查看指定月份的打卡日历，不记录打卡。\n"
+            "    ▸ **示例**: `🦌月历 11` (查看11月的日历)\n\n"
+            "4️⃣  **补签**\n"
             "    ▸ **命令**: `🦌补签 [日期] [次数]`\n"
             "    ▸ **作用**: 为本月指定日期补上打卡记录。\n"
             "    ▸ **示例**: `🦌补签 1 5` (为本月1号补签5次)\n\n"
-            "4️⃣  **显示此帮助**\n"
+            "5️⃣  **显示此帮助**\n"
             "    ▸ **命令**: `🦌帮助`\n\n"
             "祝您一🦌顺畅！"
         )
