@@ -13,7 +13,8 @@ from .resources.deer_core import DeerCore
 from .resources.klittra_core import KlittraCore
 
 FONT_FILE = "font.ttf"
-DB_NAME = "deer_checkin.db"
+DEER_DB_NAME = "deer_checkin.db"
+KLITTRA_DB_NAME = "klittra_checkin.db"
 
 
 @register(
@@ -41,14 +42,15 @@ class DeerCheckinPlugin(Star):
         os.makedirs(data_dir, exist_ok=True)
         plugin_dir = os.path.dirname(__file__)
         resources_dir = os.path.join(plugin_dir, "resources")
-        self.db_path = os.path.join(data_dir, DB_NAME)
+        self.deer_db_path = os.path.join(data_dir, DEER_DB_NAME)
+        self.klittra_db_path = os.path.join(data_dir, KLITTRA_DB_NAME)
         self.font_path = os.path.join(resources_dir, FONT_FILE)
         self.temp_dir = os.path.join(plugin_dir, "tmp")
         os.makedirs(self.temp_dir, exist_ok=True)
 
         # Initialize the core utility classes
-        self.deer_core = DeerCore(self.font_path, self.db_path, self.temp_dir)
-        self.klittra_core = KlittraCore(self.font_path, self.db_path, self.temp_dir)
+        self.deer_core = DeerCore(self.font_path, self.deer_db_path, self.temp_dir)
+        self.klittra_core = KlittraCore(self.font_path, self.klittra_db_path, self.temp_dir)
 
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -64,12 +66,26 @@ class DeerCheckinPlugin(Star):
     async def _init_db(self):
         """初始化数据库和表结构"""
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            # 初始化鹿打卡数据库
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS checkin (
                         user_id TEXT NOT NULL,
                         checkin_date TEXT NOT NULL,
                         deer_count INTEGER NOT NULL,
+                        PRIMARY KEY (user_id, checkin_date)
+                    )
+                ''')
+                await conn.commit()
+            logger.info("鹿打卡数据库初始化成功。")
+
+            # 初始化扣日历数据库
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS klittra_checkin (
+                        user_id TEXT NOT NULL,
+                        checkin_date TEXT NOT NULL,
+                        klittra_count INTEGER NOT NULL,
                         PRIMARY KEY (user_id, checkin_date)
                     )
                 ''')
@@ -80,7 +96,7 @@ class DeerCheckinPlugin(Star):
                     )
                 ''')
                 await conn.commit()
-            logger.info("鹿打卡数据库初始化成功。")
+            logger.info("扣日历数据库初始化成功。")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
 
@@ -88,7 +104,8 @@ class DeerCheckinPlugin(Star):
         """检查是否进入新月份，如果是则清空旧数据（根据配置决定）"""
         current_month = date.today().strftime("%Y-%m")
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            # 清理鹿打卡数据库
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 cursor = await conn.execute("SELECT value FROM metadata WHERE key = 'last_cleanup_month'")
                 last_cleanup = await cursor.fetchone()
 
@@ -96,12 +113,25 @@ class DeerCheckinPlugin(Star):
                     # 根据配置决定是否删除上月数据
                     if self.auto_delete_last_month_data:
                         await conn.execute("DELETE FROM checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
-                        logger.info(f"已执行月度清理，删除了非 {current_month} 的数据。")
-                    else:
-                        logger.info(f"月度清理：保留历史数据，未删除上月数据。")
+                        logger.info(f"已执行月度清理，删除了鹿打卡数据中非 {current_month} 的数据。")
 
                     await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                                        ("last_cleanup_month", current_month))
+                    await conn.commit()
+
+            # 清理扣日历数据库
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                cursor = await conn.execute("SELECT value FROM metadata WHERE key = 'last_cleanup_month_klittra'")
+                last_cleanup = await cursor.fetchone()
+
+                if not last_cleanup or last_cleanup[0] != current_month:
+                    # 根据配置决定是否删除上月数据
+                    if self.auto_delete_last_month_data:
+                        await conn.execute("DELETE FROM klittra_checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
+                        logger.info(f"已执行月度清理，删除了扣日历数据中非 {current_month} 的数据。")
+
+                    await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                                       ("last_cleanup_month_klittra", current_month))
                     await conn.commit()
         except Exception as e:
             logger.error(f"月度数据清理失败: {e}")
@@ -143,7 +173,7 @@ class DeerCheckinPlugin(Star):
         # 检查每日和每月计入次数限制
         if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
             # 查询当前日期和当前月份的打卡次数
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 # 查询当日打卡次数
                 if self.daily_max_checkins > 0:
                     cursor = await conn.execute('''
@@ -185,7 +215,7 @@ class DeerCheckinPlugin(Star):
                         return
 
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 await conn.execute('''
                     INSERT INTO checkin (user_id, checkin_date, deer_count)
                     VALUES (?, ?, ?)
@@ -243,11 +273,11 @@ class DeerCheckinPlugin(Star):
         # 检查每日和每月计入次数限制（复用 deer 的限制配置）
         if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
             # 查询当前日期和当前月份的打卡次数
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
                 # 查询当日打卡次数
                 if self.daily_max_checkins > 0:
                     cursor = await conn.execute('''
-                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                        SELECT klittra_count FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?
                     ''', (user_id, today_str))
                     today_record = await cursor.fetchone()
 
@@ -263,7 +293,7 @@ class DeerCheckinPlugin(Star):
                     current_month = today_str[:7]  # YYYY-MM
                     # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
-                        SELECT SUM(deer_count) FROM checkin
+                        SELECT SUM(klittra_count) FROM klittra_checkin
                         WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ? AND checkin_date != ?
                     ''', (user_id, current_month, today_str))
                     monthly_record = await cursor.fetchone()
@@ -272,7 +302,7 @@ class DeerCheckinPlugin(Star):
 
                     # 查询当天已有的数量
                     cursor = await conn.execute('''
-                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                        SELECT klittra_count FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?
                     ''', (user_id, today_str))
                     today_record = await cursor.fetchone()
                     existing_count = today_record[0] if today_record and today_record[0] is not None else 0
@@ -285,12 +315,12 @@ class DeerCheckinPlugin(Star):
                         return
 
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
                 await conn.execute('''
-                    INSERT INTO checkin (user_id, checkin_date, deer_count)
+                    INSERT INTO klittra_checkin (user_id, checkin_date, klittra_count)
                     VALUES (?, ?, ?)
                     ON CONFLICT(user_id, checkin_date)
-                    DO UPDATE SET deer_count = deer_count + excluded.deer_count;
+                    DO UPDATE SET klittra_count = klittra_count + excluded.klittra_count;
                 ''', (user_id, today_str, pinch_count))
                 await conn.commit()
             logger.info(f"用户 {user_name} ({user_id}) 扣日历记录成功，记录了 {pinch_count} 个🤏。")
@@ -304,7 +334,7 @@ class DeerCheckinPlugin(Star):
         user_name = event.get_sender_name()
 
         result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
-            event, user_id, user_name, self.db_path
+            event, user_id, user_name, self.klittra_db_path
         )
 
         if result_text:
@@ -362,28 +392,59 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
         user_name = event.get_sender_name()
-        logger.info(f"用户 {user_name} ({event.get_sender_id()}) 使用命令查询扣日历。")
+        current_year = date.today().year
+        current_month = date.today().month
+        current_month_str = date.today().strftime("%Y-%m")
 
-        # 发送扣日历
-        result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
-            event, user_id, user_name, self.db_path
-        )
+        checkin_records = {}
+        total_deer_this_month = 0
+        try:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, klittra_count FROM klittra_checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    (user_id, current_month_str)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result("您本月还没有扣日历记录哦，发送“🤏”开始第一次记录吧！")
+                        return
 
-        if result_text:
-            yield event.plain_result(result_text)
-            if has_error:
-                return
+                    for row in rows:
+                        day = int(row[0].split('-')[2])
+                        count = row[1]
+                        checkin_records[day] = count
+                        total_deer_this_month += count
+        except Exception as e:
+            logger.error(f"查询用户 {user_name} ({user_id}) 的扣日历月度数据失败: {e}")
+            yield event.plain_result("查询扣日历数据时出错了 >_<")
+            return
 
-        if image_path:
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self.klittra_core._create_klittra_calendar_image,
+                user_id,
+                user_name,
+                current_year,
+                current_month,
+                checkin_records,
+                total_deer_this_month
+            )
             yield event.image_result(image_path)
-
-        # Clean up the image file
-        if image_path and os.path.exists(image_path):
-            try:
-                await asyncio.to_thread(os.remove, image_path)
-                logger.debug(f"已成功删除临时图片: {image_path}")
-            except OSError as e:
-                logger.error(f"删除临时图片 {image_path} 失败: {e}")
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成扣日历图片。")
+            yield event.plain_result(
+                f"服务器缺少字体文件，无法生成扣日历图片。本月您已扣了{len(checkin_records)}天，累计{total_deer_this_month}次。")
+        except Exception as e:
+            logger.error(f"生成或发送扣日历图片失败: {e}")
+            yield event.plain_result("处理扣日历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
     @filter.regex(r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$')
     async def handle_retro_checkin(self, event: AstrMessageEvent):
@@ -446,7 +507,7 @@ class DeerCheckinPlugin(Star):
         # 检查每日和每月计入次数限制（针对补签日期）
         if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
             # 查询当前日期和当前月份的打卡次数
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 # 查询当日打卡次数
                 if self.daily_max_checkins > 0:
                     cursor = await conn.execute('''
@@ -488,7 +549,7 @@ class DeerCheckinPlugin(Star):
                         return
 
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 await conn.execute('''
                     INSERT INTO checkin (user_id, checkin_date, deer_count)
                     VALUES (?, ?, ?)
@@ -538,7 +599,7 @@ class DeerCheckinPlugin(Star):
         # 查询当月所有用户的打卡数据
         all_users_data = []
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 async with conn.execute(
                     "SELECT user_id, SUM(deer_count) as total_deer FROM checkin WHERE strftime('%Y-%m', checkin_date) = ? GROUP BY user_id ORDER BY total_deer DESC",
                     (current_month_str,)
@@ -770,7 +831,6 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
-        from datetime import datetime
         current_year = datetime.now().year
         user_name = event.get_sender_name()
 
@@ -779,7 +839,7 @@ class DeerCheckinPlugin(Star):
         # 查询今年所有月份的打卡记录
         yearly_data = {}
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 async with conn.execute(
                     "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
                     (user_id, str(current_year))
@@ -855,7 +915,6 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
-        from datetime import datetime
         current_year = datetime.now().year
         user_name = event.get_sender_name()
 
@@ -864,9 +923,9 @@ class DeerCheckinPlugin(Star):
         # 查询今年所有月份的扣日历记录
         yearly_data = {}
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
                 async with conn.execute(
-                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
+                    "SELECT checkin_date, klittra_count FROM klittra_checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
                     (user_id, str(current_year))
                 ) as cursor:
                     rows = await cursor.fetchall()
@@ -936,8 +995,6 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
-        # 解析月份参数
-        import re
         pattern = r'^🦌月历\s+(\d{1,2})$'
         match = re.search(pattern, event.message_str)
         if not match:
@@ -972,7 +1029,7 @@ class DeerCheckinPlugin(Star):
         checkin_records = {}
         total_deer_this_month = 0
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
                 async with conn.execute(
                     "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
                     (user_id, target_month_str)
@@ -1041,8 +1098,6 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
-        # 解析月份参数
-        import re
         pattern = r'^🤏月历\s+(\d{1,2})$'
         match = re.search(pattern, event.message_str)
         if not match:
@@ -1077,9 +1132,9 @@ class DeerCheckinPlugin(Star):
         checkin_records = {}
         total_deer_this_month = 0
         try:
-            async with aiosqlite.connect(self.db_path) as conn:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
                 async with conn.execute(
-                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    "SELECT checkin_date, klittra_count FROM klittra_checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
                     (user_id, target_month_str)
                 ) as cursor:
                     rows = await cursor.fetchall()
@@ -1117,6 +1172,125 @@ class DeerCheckinPlugin(Star):
         except Exception as e:
             logger.error(f"生成或发送扣日历图片失败: {e}")
             yield event.plain_result("处理扣日历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
+    @filter.regex(r'^🤏排行$')
+    async def handle_klittra_ranking(self, event: AstrMessageEvent):
+        """
+        响应 '扣日历排行' 命令，生成并发送当前月度的扣日历排行榜图片。
+        """
+        # 检查是否在群聊中
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用此功能！")
+            return
+
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            logger.info(f"群 {group_id} 不在白名单中，忽略请求")
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            logger.info(f"用户 {user_id} 在黑名单中，忽略请求")
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        current_year = date.today().year
+        current_month = date.today().month
+        current_month_str = date.today().strftime("%Y-%m")
+
+        logger.info(f"开始查询群 {group_id} 的 {current_month_str} 月扣日历排行榜数据")
+
+        # 查询当月所有用户的扣日历数据
+        all_users_data = []
+        try:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                async with conn.execute(
+                    "SELECT user_id, SUM(klittra_count) as total_klittra FROM klittra_checkin WHERE strftime('%Y-%m', checkin_date) = ? GROUP BY user_id ORDER BY total_klittra DESC",
+                    (current_month_str,)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        user_id, total_klittra = row
+                        all_users_data.append((user_id, total_klittra))
+            logger.info(f"查询到 {len(all_users_data)} 个用户的扣日历数据")
+        except Exception as e:
+            logger.error(f"查询当月扣日历排行榜数据失败: {e}")
+            yield event.plain_result("查询扣日历排行榜数据时出错了 >_<")
+            return
+
+        if not all_users_data:
+            logger.info("本月没有任何扣日历记录")
+            yield event.plain_result("本月还没有任何扣日历记录哦，快发送“🤏”开始扣日历吧！")
+            return
+
+        # 获取当前群的所有成员
+        try:
+            group_members = await self._get_group_members(event, group_id)
+            if not group_members:
+                logger.warning(f"无法获取群 {group_id} 的成员列表")
+                yield event.plain_result("无法获取群成员信息，无法生成扣日历排行榜。")
+                return
+        except Exception as e:
+            logger.error(f"获取群成员列表失败: {e}")
+            yield event.plain_result("获取群成员信息时出错了 >_<")
+            return
+
+        # 调试信息：显示当前用户是否在群成员中
+        group_user_ids = {str(member['user_id']) for member in group_members}  # 确保转换为字符串
+
+        # 过滤出当前群的用户
+        ranking_data = [(user_id, klittra_count) for user_id, klittra_count in all_users_data if str(user_id) in group_user_ids]
+
+        # 根据配置的每月上限过滤数据（如果设置了限制）
+        if self.monthly_max_checkins > 0:
+            ranking_data = [(user_id, klittra_count) for user_id, klittra_count in ranking_data if klittra_count <= self.monthly_max_checkins]
+
+        # 只取前self.ranking_display_count名（默认10名）
+        ranking_display_count = getattr(self, 'ranking_display_count', 10)  # 默认显示10名
+        ranking_data = ranking_data[:ranking_display_count]
+
+        if not ranking_data:
+            logger.info(f"群 {group_id} 中本月没有用户有扣日历记录，所有 {len(all_users_data)} 个有记录的用户都不在群中或超过限制")
+            yield event.plain_result("本月本群还没有任何扣日历记录哦，快发送“🤏”开始扣日历吧！")
+            return
+
+        # 获取用户昵称
+        user_names = []
+        for user_id, _ in ranking_data:
+            try:
+                user_name = await self._get_user_name(event, user_id)
+                user_names.append(user_name)
+            except Exception:
+                user_names.append(f"用户{user_id}")
+
+        # 生成排行榜图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self.klittra_core._create_klittra_ranking_image,
+                user_names,
+                ranking_data,
+                current_year,
+                current_month
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成扣日历排行榜图片。")
+            ranking_text = f"🤏{current_year}年{current_month}月扣日历排行榜:\n"
+            for i, (user_name, klittra_count) in enumerate(zip(user_names, [data[1] for data in ranking_data]), 1):
+                ranking_text += f"{i}. {user_name}: {klittra_count}次\n"
+            yield event.plain_result(ranking_text)
+        except Exception as e:
+            logger.error(f"生成或发送扣日历排行榜图片失败: {e}")
+            yield event.plain_result("处理扣日历排行榜图片时发生了未知错误 >_<")
         finally:
             if image_path and os.path.exists(image_path):
                 try:
@@ -1231,7 +1405,7 @@ class DeerCheckinPlugin(Star):
 
         # Use the deer_core method
         result_text, image_path, has_error = await self.deer_core._generate_and_send_calendar(
-            event, user_id, user_name, self.db_path
+            event, user_id, user_name, self.deer_db_path
         )
 
         if result_text:

@@ -1,6 +1,6 @@
 """
 Klittra功能模块
-提供与 deer 日历类似的功能，但用于扣日历记录
+提供与 deer 打卡类似的功能，但用于扣日历记录
 """
 
 import aiosqlite
@@ -15,7 +15,7 @@ from astrbot.api import logger
 
 
 class KlittraCore:
-    """Klittra核心工具类"""
+    """扣日历核心工具类"""
 
     def __init__(self, font_path: str, db_path: str, temp_dir: str):
         self.font_path = font_path
@@ -79,16 +79,16 @@ class KlittraCore:
                 draw.text((x_pos + cell_width - 10, y_offset + 5), str(day_num), font=font_day, fill=DAY_COLOR,
                           anchor="ra")
                 if day_num in checkin_data:
-                    # 绘制 '✓'
+                    # 绘制 '√'
                     draw.text(
                         (x_pos + cell_width / 2, y_offset + cell_height / 2 - 5),
-                        "✓", font=font_check_mark, fill=CHECKIN_MARK_COLOR, anchor="mm"
+                        "√", font=font_check_mark, fill=CHECKIN_MARK_COLOR, anchor="mm"
                     )
-                    # 绘制 '周期'
-                    cycle_text = f"扣了 {checkin_data[day_num]} 次"
+                    # 绘制 '扣了几次'
+                    klittra_text = f"扣了 {checkin_data[day_num]} 次"
                     draw.text(
                         (x_pos + cell_width / 2, y_offset + cell_height / 2 + 20),
-                        cycle_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
+                        klittra_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
                     )
             y_offset += cell_height
 
@@ -102,7 +102,7 @@ class KlittraCore:
 
     def _create_klittra_yearly_calendar_image(self, user_id: str, user_name: str, year: int, yearly_data: dict) -> str:
         """
-        绘制扣年度日历图片，将12个月的日历按网格排列
+        绘制年度扣日历图片，将12个月的日历按网格排列
         """
         from datetime import date
         import calendar
@@ -199,14 +199,14 @@ class KlittraCore:
 
                     # 检查是否有记录
                     if month in yearly_data and day_num in yearly_data[month]:
-                        cycle_count = yearly_data[month][day_num]
+                        klittra_count = yearly_data[month][day_num]
                         # 有记录的日期使用红色
                         day_color = (255, 0, 0)  # 红色
-                        # 绘制 '周期' 数量
-                        cycle_text = f"{cycle_count}"
+                        # 绘制 '扣了几次' 数量
+                        klittra_text = f"{klittra_count}"
                         draw.text(
                             (day_x + day_width / 2, day_y + 8),
-                            cycle_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
+                            klittra_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
                         )
                     else:
                         # 没有记录的日期使用普通颜色
@@ -233,11 +233,11 @@ class KlittraCore:
         current_month_str = date.today().strftime("%Y-%m")
 
         checkin_records = {}
-        total_deer_this_month = 0
+        total_klittra_this_month = 0
         try:
             async with aiosqlite.connect(db_path) as conn:
                 async with conn.execute(
-                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    "SELECT checkin_date, klittra_count FROM klittra_checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
                     (user_id, current_month_str)
                 ) as cursor:
                     rows = await cursor.fetchall()
@@ -248,9 +248,9 @@ class KlittraCore:
                         day = int(row[0].split('-')[2])
                         count = row[1]
                         checkin_records[day] = count
-                        total_deer_this_month += count
+                        total_klittra_this_month += count
         except Exception as e:
-            logger.error(f"查询用户 {user_name} ({user_id}) 的扣月度数据失败: {e}")
+            logger.error(f"查询用户 {user_name} ({user_id}) 的扣日历月度数据失败: {e}")
             return "查询扣日历数据时出错了 >_<", None, True
 
         image_path = ""
@@ -262,16 +262,116 @@ class KlittraCore:
                 current_year,
                 current_month,
                 checkin_records,
-                total_deer_this_month
+                total_klittra_this_month
             )
             return None, image_path, False
         except FileNotFoundError:
             logger.error(f"字体文件未找到！无法生成扣日历图片。")
             return (
-                f"服务器缺少字体文件，无法生成扣日历图片。本月您已扣了{len(checkin_records)}天，累计{total_deer_this_month}次。",
+                f"服务器缺少字体文件，无法生成扣日历图片。本月您已扣了{len(checkin_records)}天，共{total_klittra_this_month}次。",
                 None,
                 False
             )
         except Exception as e:
             logger.error(f"生成或发送扣日历图片失败: {e}")
             return "处理扣日历图片时发生了未知错误 >_<", None, True
+
+    async def _get_klittra_user_period_data(self, user_id: str, year: int, month: int, db_path: str) -> dict:
+        """获取用户指定月份的扣日历数据"""
+        period_data = {}
+        target_month_str = f"{year}-{month:02d}"
+
+        try:
+            async with aiosqlite.connect(db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, klittra_count FROM klittra_checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    (user_id, target_month_str)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        date_str = row[0]
+                        count = row[1]
+                        day = int(date_str.split('-')[2])
+                        period_data[day] = count
+        except Exception as e:
+            logger.error(f"查询用户 {user_id} 的 {year}年{month}月扣日历数据失败: {e}")
+            return {}
+
+        return period_data
+
+    def _create_klittra_ranking_image(self, user_names: list, ranking_data: list, year: int, month: int) -> str:
+        """
+        绘制月度扣日历排行榜图片，参考日历图片风格
+        """
+        WIDTH = 700
+        # 根据排行榜项目数量动态计算高度，确保所有项目都能显示
+        ITEM_HEIGHT = 60
+        HEADER_HEIGHT = 100
+        FOOTER_HEIGHT = 60
+        total_items = len(ranking_data)
+        HEIGHT = max(600, HEADER_HEIGHT + ITEM_HEIGHT * total_items + FOOTER_HEIGHT)  # 最小高度600px
+
+        BG_COLOR = (255, 240, 245)  # 淡粉色背景
+        HEADER_COLOR = (180, 30, 60)  # 粉红色标题
+        WEEKDAY_COLOR = (150, 70, 100)  # 深粉色星期标题
+        DAY_COLOR = (100, 50, 80)  # 深粉色日期
+        DEER_COUNT_COLOR = (200, 50, 100)  # 粉红色计数
+        RANK_COLOR = (255, 100, 150)  # 粉红色排名
+
+        try:
+            font_header = ImageFont.truetype(self.font_path, 32)
+            font_weekday = ImageFont.truetype(self.font_path, 18)
+            font_day = ImageFont.truetype(self.font_path, 20)
+            font_check_mark = ImageFont.truetype(self.font_path, 28)
+            font_deer_count = ImageFont.truetype(self.font_path, 16)
+            font_summary = ImageFont.truetype(self.font_path, 18)
+        except FileNotFoundError as e:
+            logger.error(f"字体文件加载失败: {e}")
+            raise e
+
+        img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        header_text = f"{year}年{month}月 - 扣日历排行榜"
+        draw.text((WIDTH / 2, 20), header_text, font=font_header, fill=HEADER_COLOR, anchor="mt")
+
+        y_offset = 100  # 从100px开始绘制项目
+        item_height = ITEM_HEIGHT
+
+        # 绘制排行榜项目
+        for i, ((user_id, klittra_count), user_name) in enumerate(zip(ranking_data, user_names)):
+            # 绘制排名
+            if i == 0:  # 冠军
+                rank_text = "1.冠军"
+                rank_color = (255, 215, 0)  # 金色
+            elif i == 1:  # 亚军
+                rank_text = "2.亚军"
+                rank_color = (169, 169, 169)  # 银色
+            elif i == 2:  # 季军
+                rank_text = "3.季军"
+                rank_color = (139, 69, 19)   # 铜色
+            else:  # 其他
+                rank_text = f"{i+1}."
+                rank_color = RANK_COLOR      # 统一颜色
+
+            # 绘制排名
+            draw.text((50, y_offset + item_height / 2), rank_text, font=font_day, fill=rank_color, anchor="lm")
+
+            # 绘制用户名
+            draw.text((150, y_offset + item_height / 2), user_name, font=font_day, fill=DAY_COLOR, anchor="lm")
+
+            # 绘制扣日历次数
+            klittra_text = f"扣了 {klittra_count} 次"
+            draw.text((WIDTH - 50, y_offset + item_height / 2), klittra_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="rm")
+
+            y_offset += item_height
+
+        # 添加底部总结
+        total_displayed_users = len(ranking_data)
+        summary_text = f"本群共有 {total_displayed_users} 人参与扣日历"
+        draw.text((WIDTH / 2, HEIGHT - 30), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
+
+        file_path = os.path.join(self.temp_dir, f"klittra_ranking_{year}_{month}_{int(time.time())}.png")
+        img.save(file_path, format='PNG')
+        return file_path
+
