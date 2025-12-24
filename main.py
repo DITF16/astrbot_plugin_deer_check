@@ -458,6 +458,133 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
+    @filter.regex(r'^🦌(?:分析|报告)(?:\s+(\d{2}|\d{4}))?$')
+    async def handle_analysis(self, event: AstrMessageEvent):
+        """
+        响应 '🦌分析' 命令，生成并发送打卡分析报告。
+        不带参数：分析本月数据
+        两位数字：分析指定月份数据
+        四位数字：分析指定年份数据
+        """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        pattern = r'^🦌(?:分析|报告)(?:\s+(\d{2}|\d{4}))?$'
+        match = re.search(pattern, event.message_str)
+
+        user_name = event.get_sender_name()
+
+        # 解析参数
+        param = match.group(1) if match and match.group(1) else None
+
+        if param is None:
+            # 默认分析本月
+            current_date = datetime.now()
+            target_year = current_date.year
+            target_month = current_date.month
+            target_period = f"{target_year}年{target_month}月"
+
+            # 查询本月数据
+            period_data = await self._get_user_period_data(user_id, target_year, target_month)
+
+            # 生成分析报告
+            analysis_result, checkin_rate = await self._generate_monthly_analysis_report(
+                user_name, target_year, target_month, period_data
+            )
+
+        elif len(param) == 2:  # 月份
+            try:
+                target_month = int(param)
+                if not (1 <= target_month <= 12):
+                    yield event.plain_result("月份必须在1-12之间哦！")
+                    return
+            except ValueError:
+                yield event.plain_result("请输入正确的月份数字！")
+                return
+
+            # 计算年份
+            current_date = datetime.now()
+            current_month = current_date.month
+            current_year = current_date.year
+
+            if target_month > current_month:
+                target_year = current_year - 1
+            else:
+                target_year = current_year
+
+            target_period = f"{target_year}年{target_month}月"
+
+            # 查询指定月份数据
+            period_data = await self._get_user_period_data(user_id, target_year, target_month)
+
+            # 生成分析报告
+            analysis_result, checkin_rate = await self._generate_monthly_analysis_report(
+                user_name, target_year, target_month, period_data
+            )
+
+        elif len(param) == 4:  # 年份
+            try:
+                target_year = int(param)
+                current_year = datetime.now().year  # Use datetime instead of date
+                if target_year > current_year:
+                    yield event.plain_result("年份不能超过当前年份哦！")
+                    return
+            except ValueError:
+                yield event.plain_result("请输入正确的年份数字！")
+                return
+
+            target_period = f"{target_year}年"
+
+            # 查询指定年份数据
+            yearly_data = await self._get_user_yearly_data(user_id, target_year)
+
+            # 生成年份分析报告
+            analysis_result = await self._generate_yearly_analysis_report(
+                user_name, target_year, yearly_data
+            )
+        else:
+            yield event.plain_result("命令格式错误，请使用：🦌分析 [月份/年份]（如：🦌分析、🦌分析 11、🦌分析 2025）")
+            return
+
+        logger.info(f"用户 {user_name} ({user_id}) 请求查看 {target_period} 的分析报告。")
+
+        if not analysis_result:
+            yield event.plain_result(f"您在{target_period}还没有打卡记录哦，发送“🦌”开始打卡吧！")
+            return
+
+        # 生成并发送分析图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self._create_analysis_image,
+                user_name,
+                target_period,
+                analysis_result,
+                checkin_rate if 'checkin_rate' in locals() else 0.0
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成分析图片。")
+            yield event.plain_result(analysis_result)
+        except Exception as e:
+            logger.error(f"生成或发送分析图片失败: {e}")
+            yield event.plain_result("处理分析图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌年历$')
     async def handle_yearly_calendar(self, event: AstrMessageEvent):
         """
@@ -670,11 +797,15 @@ class DeerCheckinPlugin(Star):
             "    ▸ **命令**: `🦌月历 月份数字`\n"
             "    ▸ **作用**: 查看指定月份的打卡日历，不记录打卡。\n"
             "    ▸ **示例**: `🦌月历 11` (查看11月的日历)\n\n"
-            "5️⃣  **补签**\n"
+            "5️⃣  **打卡分析**\n"
+            "    ▸ **命令**: `🦌报告 [月份/年份]`\n"
+            "    ▸ **作用**: 分析您的打卡数据并生成报告。\n"
+            "    ▸ **示例**: `🦌报告` (本月分析)、`🦌报告 11` (11月分析)、`🦌报告 2025` (2025年分析)\n\n"
+            "6️⃣  **补签**\n"
             "    ▸ **命令**: `🦌补签 [日期] [次数]`\n"
             "    ▸ **作用**: 为本月指定日期补上打卡记录。\n"
             "    ▸ **示例**: `🦌补签 1 5` (为本月1号补签5次)\n\n"
-            "6️⃣  **显示此帮助**\n"
+            "7️⃣  **显示此帮助**\n"
             "    ▸ **命令**: `🦌帮助`\n\n"
             "祝您一🦌顺畅！"
         )
@@ -792,6 +923,236 @@ class DeerCheckinPlugin(Star):
         file_path = os.path.join(self.temp_dir, f"ranking_{year}_{month}_{int(time.time())}.png")
         img.save(file_path, format='PNG')
         return file_path
+
+    async def _get_user_period_data(self, user_id: str, year: int, month: int) -> dict:
+        """获取用户指定月份的打卡数据"""
+        period_data = {}
+        target_month_str = f"{year}-{month:02d}"
+
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    (user_id, target_month_str)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        date_str = row[0]
+                        count = row[1]
+                        day = int(date_str.split('-')[2])
+                        period_data[day] = count
+        except Exception as e:
+            logger.error(f"查询用户 {user_id} 的 {year}年{month}月数据失败: {e}")
+            return {}
+
+        return period_data
+
+    async def _get_user_yearly_data(self, user_id: str, year: int) -> dict:
+        """获取用户指定年份的打卡数据"""
+        yearly_data = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
+                    (user_id, str(year))
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        date_str = row[0]
+                        count = row[1]
+                        _, month, day = date_str.split('-')
+                        month = int(month)
+                        day = int(day)
+
+                        if month not in yearly_data:
+                            yearly_data[month] = {}
+                        yearly_data[month][day] = count
+        except Exception as e:
+            logger.error(f"查询用户 {user_id} 的 {year}年数据失败: {e}")
+            return {}
+
+        return yearly_data
+
+    async def _generate_monthly_analysis_report(self, user_name: str, year: int, month: int, period_data: dict) -> tuple[str, float]:
+        """生成月度趣味打卡分析报告"""
+        if not period_data:
+            return "", 0.0
+
+        from datetime import date
+        import calendar
+
+        total_days = len(period_data)          # 有记录的天数
+        total_deer = sum(period_data.values()) # 总次数
+
+        # 单日最高
+        max_day_num, max_day_count = max(period_data.items(), key=lambda x: x[1])
+
+        # 最长连续天数
+        sorted_days = sorted(period_data.keys())
+        max_consecutive = 1
+        current = 1
+        for i in range(1, len(sorted_days)):
+            if sorted_days[i] == sorted_days[i-1] + 1:
+                current += 1
+                max_consecutive = max(max_consecutive, current)
+            else:
+                current = 1
+
+        # 本月应分析天数 & 发射率
+        days_in_month = calendar.monthrange(year, month)[1]
+        today = date.today()
+        analysis_days = today.day if year == today.year and month == today.month else days_in_month
+        checkin_rate = total_days / analysis_days if analysis_days > 0 else 0
+        freq_per_day = total_deer / analysis_days if analysis_days > 0 else 0
+
+        # 纯文字幽默报告 - start with just the stats, no title since it's in the image
+        report = f"本月你一共动手 {total_days} 天，总计发射 {total_deer} 次。\n"
+
+        if max_day_count == 1:
+            report += f"每日节奏：温柔单发，优雅从容。\n"  # 或直接跳过：pass
+        else:
+            if max_day_count >= 3:
+                report += f"单日巅峰：{max_day_num}日 当天狂飙 {max_day_count} 次，手速已达职业级别，建议报名电竞。\n"
+            elif max_day_count == 2:
+                report += f"单日巅峰：{max_day_num}日 双杀达成，效率不错。\n"
+
+        if max_consecutive >= 7:
+            report += f"最长连击：连续 {max_consecutive} 天不带停！肾工厂已进入三班倒模式，建议立刻补货六味地黄丸。\n"
+        elif max_consecutive >= 4:
+            report += f"最长连击：连续 {max_consecutive} 天，节奏稳健，但腰子已经在悄悄报警了。\n"
+        elif max_consecutive >= 2:
+            report += f"最长连击：连续 {max_consecutive} 天，小连胜值得表扬。\n"
+
+        report += f"本月发射率：{checkin_rate:.1%}\n\n"
+
+        # 分级调侃
+        if freq_per_day >= 1.3:
+            report += "红色预警：重度沉迷选手！\n频率已突破安全线，肾上腺素秘书已向你腰子递交辞职信。\n再不控制，下个月可能要靠意念站立了。\n建议：多喝热水，多跑步，找点正经事干。"
+        elif freq_per_day >= 0.7:
+            report += "橙色警报：资深爱好者！\n手速稳定，但也该让右手放个假了。\n腰酸背痛没？下个月试试降到五成，奖励自己一顿烧烤？"
+        elif freq_per_day >= 0.4:
+            report += "黄色正常：中等频率，怡情有度。\n技术成熟，节奏掌握得当，继续保持即可。\n不过别忘了，现实中的桃花不会自己出现。"
+        elif freq_per_day >= 0.1:
+            report += "绿色健康：轻度选手！\n很有节制，肾在暗中给你点赞。\n继续努力，下个月争取再降一档，解锁自律达人称号。"
+        else:
+            report += "蓝色大师：几乎纯洁如白纸！\n本月肾气充盈，洪荒之力蓄势待发。\n小心哪天突然爆发，把床板震坏。\n坚持就是胜利！"
+
+        report += "\n\n小贴士：适度怡情，过度伤身。\n健康第一，兄弟冲吧！"
+
+        return report, checkin_rate
+
+    async def _generate_yearly_analysis_report(self, user_name: str, year: int, yearly_data: dict) -> str:
+        """生成年度趣味打卡分析报告（无emoji版）"""
+        if not yearly_data:
+            return ""
+
+        total_months = len(yearly_data)
+        total_days = sum(len(days) for days in yearly_data.values())
+        total_deer = sum(sum(days.values()) for days in yearly_data.values())
+
+        # 最活跃月份
+        max_month = max(yearly_data.items(), key=lambda x: sum(x[1].values()))
+        max_month_num, max_data = max_month
+        max_month_deer = sum(max_data.values())
+
+        report = f"全年共打卡 {total_months} 个月，{total_days} 天，总次数 {total_deer} 次。\n"
+        report += f"最猛月份：{max_month_num}月，当月打卡 {max_month_deer} 次，那个月你到底经历了什么？\n\n"
+
+        avg_per_month = total_deer / 12
+        if avg_per_month > 25:
+            report += "年度评价：核动力手指！\n全年无休，打卡工厂24小时加班生产。\n建议申报吉尼斯最强耐力纪录。"
+        elif avg_per_month > 15:
+            report += "年度评价：老司机稳如老狗！\n输出稳定，技术娴熟。\n明年可以尝试半戒模式，挑战更高难度。"
+        elif avg_per_month > 8:
+            report += "年度评价：中等玩家！\n有节制有放纵，生活平衡得不错，继续保持。"
+        else:
+            report += "年度评价：自律之王！\n基本纯洁，偶尔失守。\n手腕健康，明年继续当清心寡欲的典范。"
+
+        report += "\n\n新的一年，愿你手指健康，生活充实。"
+
+        return report
+
+    def _create_analysis_image(self, user_name: str, target_period: str, analysis_result: str, checkin_rate: float = 0.0) -> str:
+        """
+        绘制分析报告图片
+        """
+        WIDTH, HEIGHT = 750, 550  # 稍微加宽加高，内容更舒展
+
+        # 根据频率高低调整配色
+        if checkin_rate >= 0.7:
+            BG_COLOR = (255, 240, 240)     # 浅红背景
+            HEADER_COLOR = (180, 0, 0)
+        elif checkin_rate >= 0.4:
+            BG_COLOR = (255, 250, 230)
+            HEADER_COLOR = (160, 82, 45)
+        else:
+            BG_COLOR = (230, 245, 255)     # 浅蓝背景
+            HEADER_COLOR = (0, 100, 160)
+
+        TEXT_COLOR = (50, 50, 50)
+
+        try:
+            font_header = ImageFont.truetype(self.font_path, 32)
+            font_content = ImageFont.truetype(self.font_path, 22)  # 字体大一点，更清晰
+        except FileNotFoundError as e:
+            logger.error(f"字体文件加载失败: {e}")
+            raise e
+
+        img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # 绘制标题（居中）
+        header_text = f"{target_period} {user_name}的鹿报告"
+        header_bbox = draw.textbbox((0, 0), header_text, font=font_header)
+        header_width = header_bbox[2] - header_bbox[0]
+        draw.text(((WIDTH - header_width) // 2, 40), header_text, font=font_header, fill=HEADER_COLOR)
+
+        # 分割报告为行，并处理空行
+        lines = analysis_result.split('\n')
+        y_offset = 100
+        line_height = 35  # 关键：行高足够！（22号字 + 间距）
+
+        for line in lines:
+            line = line.strip()
+            if not line:  # 空行
+                y_offset += line_height // 2  # 空行只加一半高度
+                continue
+
+            # 计算文字宽度，实现居中（可选左对齐）
+            bbox = draw.textbbox((0, 0), line, font=font_content)
+            text_width = bbox[2] - bbox[0]
+            x_pos = (WIDTH - text_width) // 2  # 居中显示
+            # x_pos = 60  # 如果想左对齐，改成这个
+
+            draw.text((x_pos, y_offset), line, font=font_content, fill=TEXT_COLOR)
+            y_offset += line_height
+
+        # 保存
+        safe_period = target_period.replace('年', '_').replace('月', '')
+        file_path = os.path.join(self.temp_dir, f"analysis_{user_name}_{safe_period}_{int(time.time())}.png")
+        img.save(file_path, format='PNG')
+        return file_path
+
+    def _wrap_text(self, text: str, font, max_width: int) -> list:
+        """
+        文本自动换行
+        """
+        lines = []
+        current_line = ""
+
+        for char in text:
+            test_line = current_line + char
+            if font.getbbox(test_line)[2] <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = char
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines
 
     def _create_yearly_calendar_image(self, user_id: str, user_name: str, year: int, yearly_data: dict) -> str:
         """
