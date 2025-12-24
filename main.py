@@ -19,9 +19,9 @@ KLITTRA_DB_NAME = "klittra_checkin.db"
 
 @register(
     "astrbot_plugin_deer_check",
-    "DITF16",
+    "DITF16&Foolllll",
     "一个发送'🦌'表情进行打卡并生成月度日历的插件",
-    "1.2"
+    "1.3"
 )
 class DeerCheckinPlugin(Star):
     def __init__(self, context: Context, config: dict = None):

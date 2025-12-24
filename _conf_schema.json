@@ -36,8 +36,8 @@
         "default": 0
     },
     "enable_female_calendar": {
-        "description": "启用女性日历",
-        "hint": "启用后将提供女性日历功能",
+        "description": "启用女生日历",
+        "hint": "启用后将提供女生日历功能",
         "type": "bool",
         "default": false
     },
