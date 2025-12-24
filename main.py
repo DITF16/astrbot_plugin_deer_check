@@ -10,6 +10,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.star import StarTools
 from .resources.deer_core import DeerCore
+from .resources.klittra_core import KlittraCore
 
 FONT_FILE = "font.ttf"
 DB_NAME = "deer_checkin.db"
@@ -45,8 +46,9 @@ class DeerCheckinPlugin(Star):
         self.temp_dir = os.path.join(plugin_dir, "tmp")
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        # Initialize the core utility class
+        # Initialize the core utility classes
         self.deer_core = DeerCore(self.font_path, self.db_path, self.temp_dir)
+        self.klittra_core = KlittraCore(self.font_path, self.db_path, self.temp_dir)
 
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -200,6 +202,127 @@ class DeerCheckinPlugin(Star):
         async for result in self._generate_and_send_calendar(event):
             yield result
 
+    @filter.regex(r'^🤏+$')
+    async def handle_klittra_checkin(self, event: AstrMessageEvent):
+        """处理扣日历记录事件：如果启用了扣日历功能，则记录数据并发送扣日历。"""
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        user_name = event.get_sender_name()
+        pinch_count = event.message_str.count("🤏")
+
+        current_time = datetime.now()
+
+        # 解析HH:MM格式的时间
+        try:
+            hour, minute = map(int, self.day_start_time.split(':'))
+            day_start_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except (ValueError, AttributeError):
+            # 如果格式不正确，默认使用00:00
+            day_start_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # 如果当前时间小于设置的每天开始时间，则认为是前一天
+        if current_time.time() < day_start_time.time():
+            adjusted_date = current_time - timedelta(days=1)
+        else:
+            adjusted_date = current_time
+        today_str = adjusted_date.strftime("%Y-%m-%d")
+
+        # 检查每日和每月计入次数限制（复用 deer 的限制配置）
+        if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
+            # 查询当前日期和当前月份的打卡次数
+            async with aiosqlite.connect(self.db_path) as conn:
+                # 查询当日打卡次数
+                if self.daily_max_checkins > 0:
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, today_str))
+                    today_record = await cursor.fetchone()
+
+                    current_daily_count = today_record[0] if today_record else 0
+                    new_daily_count = current_daily_count + pinch_count
+
+                    if new_daily_count > self.daily_max_checkins:
+                        yield event.plain_result(f"记录失败！今日计入次数已达上限 {self.daily_max_checkins} 次。")
+                        return
+
+                # 查询当月打卡次数
+                if self.monthly_max_checkins > 0:
+                    current_month = today_str[:7]  # YYYY-MM
+                    # 查询本月其他日期的总次数
+                    cursor = await conn.execute('''
+                        SELECT SUM(deer_count) FROM checkin
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ? AND checkin_date != ?
+                    ''', (user_id, current_month, today_str))
+                    monthly_record = await cursor.fetchone()
+
+                    current_monthly_count = monthly_record[0] if monthly_record and monthly_record[0] is not None else 0
+
+                    # 查询当天已有的数量
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, today_str))
+                    today_record = await cursor.fetchone()
+                    existing_count = today_record[0] if today_record and today_record[0] is not None else 0
+
+                    # 计算打卡后的总数
+                    new_monthly_count = current_monthly_count + existing_count + pinch_count
+
+                    if new_monthly_count > self.monthly_max_checkins:
+                        yield event.plain_result(f"记录失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
+                        return
+
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                await conn.execute('''
+                    INSERT INTO checkin (user_id, checkin_date, deer_count)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, checkin_date)
+                    DO UPDATE SET deer_count = deer_count + excluded.deer_count;
+                ''', (user_id, today_str, pinch_count))
+                await conn.commit()
+            logger.info(f"用户 {user_name} ({user_id}) 扣日历记录成功，记录了 {pinch_count} 个🤏。")
+        except Exception as e:
+            logger.error(f"记录用户 {user_name} ({user_id}) 的扣日历数据失败: {e}")
+            yield event.plain_result("扣日历记录失败，数据库出错了 >_<")
+            return
+
+        # 发送扣日历
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+
+        result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
+            event, user_id, user_name, self.db_path
+        )
+
+        if result_text:
+            yield event.plain_result(result_text)
+            if has_error:
+                return
+
+        if image_path:
+            yield event.image_result(image_path)
+
+        # Clean up the image file
+        if image_path and os.path.exists(image_path):
+            try:
+                await asyncio.to_thread(os.remove, image_path)
+                logger.debug(f"已成功删除临时图片: {image_path}")
+            except OSError as e:
+                logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌日历$')
     async def handle_calendar_command(self, event: AstrMessageEvent):
         """'🦌日历' 命令，只查询并发送用户的当月打卡日历。"""
@@ -219,6 +342,48 @@ class DeerCheckinPlugin(Star):
 
         async for result in self._generate_and_send_calendar(event):
             yield result
+
+    @filter.regex(r'^🤏日历$')
+    async def handle_klittra_calendar_command(self, event: AstrMessageEvent):
+        """'🤏日历' 命令，只查询并发送用户的当月扣日历。"""
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        user_name = event.get_sender_name()
+        logger.info(f"用户 {user_name} ({event.get_sender_id()}) 使用命令查询扣日历。")
+
+        # 发送扣日历
+        result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
+            event, user_id, user_name, self.db_path
+        )
+
+        if result_text:
+            yield event.plain_result(result_text)
+            if has_error:
+                return
+
+        if image_path:
+            yield event.image_result(image_path)
+
+        # Clean up the image file
+        if image_path and os.path.exists(image_path):
+            try:
+                await asyncio.to_thread(os.remove, image_path)
+                logger.debug(f"已成功删除临时图片: {image_path}")
+            except OSError as e:
+                logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
     @filter.regex(r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$')
     async def handle_retro_checkin(self, event: AstrMessageEvent):
@@ -669,6 +834,91 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
+    @filter.regex(r'^🤏年历$')
+    async def handle_klittra_yearly_calendar(self, event: AstrMessageEvent):
+        """
+        响应 '🤏年历' 命令，生成并发送今年的完整扣日历图片。
+        """
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        from datetime import datetime
+        current_year = datetime.now().year
+        user_name = event.get_sender_name()
+
+        logger.info(f"用户 {user_name} ({user_id}) 请求查看 {current_year}年的扣年历。")
+
+        # 查询今年所有月份的扣日历记录
+        yearly_data = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
+                    (user_id, str(current_year))
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result(f"您在{current_year}年还没有扣日历记录哦，发送“🤏”开始记录吧！")
+                        return
+
+                    for row in rows:
+                        date_str = row[0]
+                        count = row[1]
+                        year, month, day = date_str.split('-')
+                        month = int(month)
+                        day = int(day)
+
+                        if month not in yearly_data:
+                            yearly_data[month] = {}
+                        yearly_data[month][day] = count
+        except Exception as e:
+            logger.error(f"查询用户 {user_name} ({user_id}) 的 {current_year}年扣日历数据失败: {e}")
+            yield event.plain_result("查询扣日历数据时出错了 >_<")
+            return
+
+        # 生成并发送扣年历图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self.klittra_core._create_klittra_yearly_calendar_image,
+                user_id,
+                user_name,
+                current_year,
+                yearly_data
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成扣日历图片。")
+            # 生成文本总结
+            total_months = len(yearly_data)
+            total_days = sum(len(days) for days in yearly_data.values())
+            total_deer = sum(sum(days.values()) for days in yearly_data.values())
+            yield event.plain_result(
+                f"服务器缺少字体文件，无法生成扣日历图片。{current_year}年您已扣了{total_months}个月，{total_days}天，共{total_deer}次。")
+        except Exception as e:
+            logger.error(f"生成或发送扣日历图片失败: {e}")
+            yield event.plain_result("处理扣日历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌月历\s+(\d{1,2})$')
     async def handle_specific_month_calendar(self, event: AstrMessageEvent):
         """
@@ -762,6 +1012,111 @@ class DeerCheckinPlugin(Star):
         except Exception as e:
             logger.error(f"生成或发送日历图片失败: {e}")
             yield event.plain_result("处理日历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
+    @filter.regex(r'^🤏月历\s+(\d{1,2})$')
+    async def handle_klittra_specific_month_calendar(self, event: AstrMessageEvent):
+        """
+        响应 '🤏月历 X' 命令，生成并发送指定月份的扣日历图片。
+        """
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        # 解析月份参数
+        import re
+        pattern = r'^🤏月历\s+(\d{1,2})$'
+        match = re.search(pattern, event.message_str)
+        if not match:
+            yield event.plain_result("命令格式错误，请使用：🤏月历 月份（如：🤏月历 11）")
+            return
+
+        try:
+            target_month = int(match.group(1))
+            if not (1 <= target_month <= 12):
+                yield event.plain_result("月份必须在1-12之间哦！")
+                return
+        except ValueError:
+            yield event.plain_result("请输入正确的月份数字！")
+            return
+
+        # 计算年份：如果指定月份大于当前月份，则为去年
+        current_date = datetime.now()
+        current_month = current_date.month
+        current_year = current_date.year
+
+        if target_month > current_month:
+            target_year = current_year - 1
+        else:
+            target_year = current_year
+
+        target_month_str = f"{target_year}-{target_month:02d}"
+        user_name = event.get_sender_name()
+
+        logger.info(f"用户 {user_name} ({user_id}) 请求查看 {target_year}年{target_month}月的扣日历。")
+
+        # 查询指定月份的扣日历记录
+        checkin_records = {}
+        total_deer_this_month = 0
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?",
+                    (user_id, target_month_str)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result(f"您在{target_year}年{target_month}月还没有扣日历记录哦，发送“🤏”开始记录吧！")
+                        return
+
+                    for row in rows:
+                        day = int(row[0].split('-')[2])
+                        count = row[1]
+                        checkin_records[day] = count
+                        total_deer_this_month += count
+        except Exception as e:
+            logger.error(f"查询用户 {user_name} ({user_id}) 的 {target_year}年{target_month}月扣日历数据失败: {e}")
+            yield event.plain_result("查询扣日历数据时出错了 >_<")
+            return
+
+        # 生成并发送扣日历图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self.klittra_core._create_klittra_calendar_image,
+                user_id,
+                user_name,
+                target_year,
+                target_month,
+                checkin_records,
+                total_deer_this_month
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成扣日历图片。")
+            yield event.plain_result(
+                f"服务器缺少字体文件，无法生成扣日历图片。{target_year}年{target_month}月您已扣了{len(checkin_records)}天，共{total_deer_this_month}次。")
+        except Exception as e:
+            logger.error(f"生成或发送扣日历图片失败: {e}")
+            yield event.plain_result("处理扣日历图片时发生了未知错误 >_<")
         finally:
             if image_path and os.path.exists(image_path):
                 try:
