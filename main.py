@@ -342,7 +342,7 @@ class DeerCheckinPlugin(Star):
     @filter.regex(r'^🦌排行$')
     async def handle_deer_ranking(self, event: AstrMessageEvent):
         """
-        响应 '🦌排行' 命令，生成并发送当前月度的打卡排行榜图片。
+        响应 '鹿排行' 命令，生成并发送当前月度的打卡排行榜图片。
         """
         # 检查是否在群聊中
         group_id = event.get_group_id()
@@ -353,15 +353,19 @@ class DeerCheckinPlugin(Star):
         user_id = event.get_sender_id()
 
         if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            logger.info(f"群 {group_id} 不在白名单中，忽略请求")
             return  # 不在白名单中的群组不处理
 
         if user_id in self.user_blacklist:
+            logger.info(f"用户 {user_id} 在黑名单中，忽略请求")
             return  # 黑名单用户不处理
 
         await self._ensure_initialized()
         current_year = date.today().year
         current_month = date.today().month
         current_month_str = date.today().strftime("%Y-%m")
+
+        logger.info(f"开始查询群 {group_id} 的 {current_month_str} 月排行榜数据")
 
         # 查询当月所有用户的打卡数据
         all_users_data = []
@@ -375,12 +379,14 @@ class DeerCheckinPlugin(Star):
                     for row in rows:
                         user_id, total_deer = row
                         all_users_data.append((user_id, total_deer))
+            logger.info(f"查询到 {len(all_users_data)} 个用户的打卡数据")
         except Exception as e:
             logger.error(f"查询当月排行榜数据失败: {e}")
             yield event.plain_result("查询排行榜数据时出错了 >_<")
             return
 
         if not all_users_data:
+            logger.info("本月没有任何打卡记录")
             yield event.plain_result("本月还没有任何打卡记录哦，快发送“🦌”开始打卡吧！")
             return
 
@@ -389,7 +395,6 @@ class DeerCheckinPlugin(Star):
             group_members = await self._get_group_members(event, group_id)
             if not group_members:
                 logger.warning(f"无法获取群 {group_id} 的成员列表")
-                # 如果无法获取群成员，返回所有数据但不建议使用
                 yield event.plain_result("无法获取群成员信息，无法生成排行榜。")
                 return
         except Exception as e:
@@ -397,15 +402,22 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result("获取群成员信息时出错了 >_<")
             return
 
+        # 调试信息：显示当前用户是否在群成员中
+        group_user_ids = {str(member['user_id']) for member in group_members}  # 确保转换为字符串
+
         # 过滤出当前群的用户
-        group_user_ids = {member['user_id'] for member in group_members}
-        ranking_data = [(user_id, deer_count) for user_id, deer_count in all_users_data if user_id in group_user_ids]
+        ranking_data = [(user_id, deer_count) for user_id, deer_count in all_users_data if str(user_id) in group_user_ids]
+
+        # 根据配置的每月上限过滤数据（如果设置了限制）
+        if self.monthly_max_checkins > 0:
+            ranking_data = [(user_id, deer_count) for user_id, deer_count in ranking_data if deer_count <= self.monthly_max_checkins]
 
         # 只取前self.ranking_display_count名（默认10名）
         ranking_display_count = getattr(self, 'ranking_display_count', 10)  # 默认显示10名
         ranking_data = ranking_data[:ranking_display_count]
 
         if not ranking_data:
+            logger.info(f"群 {group_id} 中本月没有用户有打卡记录，所有 {len(all_users_data)} 个有记录的用户都不在群中或超过限制")
             yield event.plain_result("本月本群还没有任何打卡记录哦，快发送“🦌”开始打卡吧！")
             return
 
@@ -518,21 +530,30 @@ class DeerCheckinPlugin(Star):
 
     def _create_ranking_image(self, user_names: list, ranking_data: list, year: int, month: int) -> str:
         """
-        绘制月度打卡排行榜图片
+        绘制月度打卡排行榜图片，参考日历图片风格
         """
-        WIDTH, HEIGHT = 700, 600
+        WIDTH = 700
+        # 根据排行榜项目数量动态计算高度，确保所有项目都能显示
+        ITEM_HEIGHT = 60
+        HEADER_HEIGHT = 100
+        FOOTER_HEIGHT = 60
+        total_items = len(ranking_data)
+        HEIGHT = max(600, HEADER_HEIGHT + ITEM_HEIGHT * total_items + FOOTER_HEIGHT)  # 最小高度600px
+
         BG_COLOR = (255, 255, 255)
         HEADER_COLOR = (50, 50, 50)
-        RANK_COLOR = (100, 100, 100)
-        NAME_COLOR = (80, 80, 80)
-        COUNT_COLOR = (139, 69, 19)
-        TOP3_BG_COLOR = [(255, 215, 0), (220, 220, 220), (205, 133, 63)]  # 金银铜牌背景
+        WEEKDAY_COLOR = (100, 100, 100)
+        DAY_COLOR = (80, 80, 80)
+        DEER_COUNT_COLOR = (139, 69, 19)
+        RANK_COLOR = (0, 150, 50)
 
         try:
             font_header = ImageFont.truetype(self.font_path, 32)
-            font_rank = ImageFont.truetype(self.font_path, 24)
-            font_name = ImageFont.truetype(self.font_path, 20)
-            font_count = ImageFont.truetype(self.font_path, 22)
+            font_weekday = ImageFont.truetype(self.font_path, 18)
+            font_day = ImageFont.truetype(self.font_path, 20)
+            font_check_mark = ImageFont.truetype(self.font_path, 28)
+            font_deer_count = ImageFont.truetype(self.font_path, 16)
+            font_summary = ImageFont.truetype(self.font_path, 18)
         except FileNotFoundError as e:
             logger.error(f"字体文件加载失败: {e}")
             raise e
@@ -540,39 +561,44 @@ class DeerCheckinPlugin(Star):
         img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
         draw = ImageDraw.Draw(img)
 
-        # 绘制标题
-        header_text = f"{year}年{month}月🦌打卡排行榜"
-        draw.text((WIDTH / 2, 30), header_text, font=font_header, fill=HEADER_COLOR, anchor="mt")
+        header_text = f"{year}年{month}月 - 鹿打卡排行榜"
+        draw.text((WIDTH / 2, 20), header_text, font=font_header, fill=HEADER_COLOR, anchor="mt")
 
-        # 绘制排行榜项
-        item_height = 50
-        start_y = 100
+        y_offset = 100  # 从100px开始绘制项目
+        item_height = ITEM_HEIGHT
+
+        # 绘制排行榜项目
         for i, ((user_id, deer_count), user_name) in enumerate(zip(ranking_data, user_names)):
-            y_pos = start_y + i * item_height
-
-            # 为前三名设置特殊背景
-            if i < 3:
-                bg_color = TOP3_BG_COLOR[i]
-                draw.rectangle([50, y_pos - 10, WIDTH - 50, y_pos + item_height - 10], fill=bg_color)
+            # 绘制排名
+            if i == 0:  # 冠军
+                rank_text = "1.冠军"
+                rank_color = (255, 215, 0)  # 金色
+            elif i == 1:  # 亚军
+                rank_text = "2.亚军"
+                rank_color = (169, 169, 169)  # 银色
+            elif i == 2:  # 季军
+                rank_text = "3.季军"
+                rank_color = (139, 69, 19)   # 铜色
+            else:  # 其他
+                rank_text = f"{i+1}."
+                rank_color = RANK_COLOR      # 统一颜色
 
             # 绘制排名
-            rank_text = f"{i+1}."
-            if i == 0:
-                rank_color = (255, 215, 0)  # 金牌色
-            elif i == 1:
-                rank_color = (169, 169, 169)  # 银牌色
-            elif i == 2:
-                rank_color = (139, 69, 19)   # 铜牌色
-            else:
-                rank_color = RANK_COLOR
-            draw.text((80, y_pos + item_height / 2), rank_text, font=font_rank, fill=rank_color, anchor="lm")
+            draw.text((50, y_offset + item_height / 2), rank_text, font=font_day, fill=rank_color, anchor="lm")
 
             # 绘制用户名
-            draw.text((150, y_pos + item_height / 2), user_name, font=font_name, fill=NAME_COLOR, anchor="lm")
+            draw.text((150, y_offset + item_height / 2), user_name, font=font_day, fill=DAY_COLOR, anchor="lm")
 
             # 绘制打卡次数
-            count_text = f"{deer_count}次"
-            draw.text((WIDTH - 100, y_pos + item_height / 2), count_text, font=font_count, fill=COUNT_COLOR, anchor="rm")
+            deer_text = f"鹿 {deer_count} 次"
+            draw.text((WIDTH - 50, y_offset + item_height / 2), deer_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="rm")
+
+            y_offset += item_height
+
+        # 添加底部总结
+        total_displayed_users = len(ranking_data)
+        summary_text = f"本群共有 {total_displayed_users} 人参与打卡"
+        draw.text((WIDTH / 2, HEIGHT - 30), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
 
         file_path = os.path.join(self.temp_dir, f"ranking_{year}_{month}_{int(time.time())}.png")
         img.save(file_path, format='PNG')
