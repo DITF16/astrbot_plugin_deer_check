@@ -93,7 +93,7 @@ class KlittraCore:
             y_offset += cell_height
 
         total_days = len(checkin_data)
-        summary_text = f"本月总结：累计扣了 {total_days} 天，共 {total_deer} 次"
+        summary_text = f"本月总结：累计扣了 {total_days} 天，共扣 {total_deer} 次"
         draw.text((WIDTH / 2, HEIGHT - 30), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
 
         file_path = os.path.join(self.temp_dir, f"klittra_calendar_{user_id}_{int(time.time())}.png")
@@ -268,7 +268,7 @@ class KlittraCore:
         except FileNotFoundError:
             logger.error(f"字体文件未找到！无法生成扣日历图片。")
             return (
-                f"服务器缺少字体文件，无法生成扣日历图片。本月您已扣了{len(checkin_records)}天，共{total_klittra_this_month}次。",
+                f"服务器缺少字体文件，无法生成扣日历图片。本月您已扣了{len(checkin_records)}天，共扣{total_klittra_this_month}次。",
                 None,
                 False
             )
