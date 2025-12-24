@@ -1,6 +1,6 @@
 import aiosqlite
 import calendar
-from datetime import date
+from datetime import date, datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont
 import os
 import re
@@ -22,8 +22,19 @@ DB_NAME = "deer_checkin.db"
     "1.2"
 )
 class DeerCheckinPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        self.config = config if config is not None else {}
+
+        # 配置项
+        self.group_whitelist = self.config.get("group_whitelist", [])
+        self.user_blacklist = self.config.get("user_blacklist", [])
+        self.day_start_time = self.config.get("day_start_time", "00:00")
+        self.auto_delete_last_month_data = bool(self.config.get("auto_delete_last_month_data", True))
+        self.daily_max_checkins = int(self.config.get("daily_max_checkins", 0))
+        self.monthly_max_checkins = int(self.config.get("monthly_max_checkins", 0))
+        self.enable_female_calendar = bool(self.config.get("enable_female_calendar", False))
+
         data_dir = StarTools.get_data_dir("astrbot_plugin_deer_check")
         os.makedirs(data_dir, exist_ok=True)
         plugin_dir = os.path.dirname(__file__)
@@ -68,7 +79,7 @@ class DeerCheckinPlugin(Star):
             logger.error(f"数据库初始化失败: {e}")
 
     async def _monthly_cleanup(self):
-        """检查是否进入新月份，如果是则清空旧数据"""
+        """检查是否进入新月份，如果是则清空旧数据（根据配置决定）"""
         current_month = date.today().strftime("%Y-%m")
         try:
             async with aiosqlite.connect(self.db_path) as conn:
@@ -76,22 +87,86 @@ class DeerCheckinPlugin(Star):
                 last_cleanup = await cursor.fetchone()
 
                 if not last_cleanup or last_cleanup[0] != current_month:
-                    await conn.execute("DELETE FROM checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
+                    # 根据配置决定是否删除上月数据
+                    if self.auto_delete_last_month_data:
+                        await conn.execute("DELETE FROM checkin WHERE strftime('%Y-%m', checkin_date) != ?", (current_month,))
+                        logger.info(f"已执行月度清理，删除了非 {current_month} 的数据。")
+                    else:
+                        logger.info(f"月度清理：保留历史数据，未删除上月数据。")
+
                     await conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                                        ("last_cleanup_month", current_month))
                     await conn.commit()
-                    logger.info(f"已执行月度清理，现在是 {current_month}。")
         except Exception as e:
             logger.error(f"月度数据清理失败: {e}")
 
     @filter.regex(r'^🦌+$')
     async def handle_deer_checkin(self, event: AstrMessageEvent):
         """处理鹿打卡事件：记录数据，然后发送日历。"""
-        await self._ensure_initialized()
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
         user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
         user_name = event.get_sender_name()
         deer_count = event.message_str.count("🦌")
-        today_str = date.today().strftime("%Y-%m-%d")
+
+        current_time = datetime.now()
+
+        # 解析HH:MM格式的时间
+        try:
+            hour, minute = map(int, self.day_start_time.split(':'))
+            day_start_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except (ValueError, AttributeError):
+            # 如果格式不正确，默认使用00:00
+            day_start_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # 如果当前时间小于设置的每天开始时间，则认为是前一天
+        if current_time.time() < day_start_time.time():
+            adjusted_date = current_time - timedelta(days=1)
+        else:
+            adjusted_date = current_time
+        today_str = adjusted_date.strftime("%Y-%m-%d")
+
+        # 检查每日和每月计入次数限制
+        if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
+            # 查询当前日期和当前月份的打卡次数
+            async with aiosqlite.connect(self.db_path) as conn:
+                # 查询当日打卡次数
+                if self.daily_max_checkins > 0:
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, today_str))
+                    today_record = await cursor.fetchone()
+
+                    current_daily_count = today_record[0] if today_record else 0
+                    new_daily_count = current_daily_count + deer_count
+
+                    if new_daily_count > self.daily_max_checkins:
+                        yield event.plain_result(f"打卡失败！今日计入次数已达上限 {self.daily_max_checkins} 次。")
+                        return
+
+                # 查询当月打卡次数
+                if self.monthly_max_checkins > 0:
+                    current_month = today_str[:7]  # YYYY-MM
+                    cursor = await conn.execute('''
+                        SELECT SUM(deer_count) FROM checkin
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?
+                    ''', (user_id, current_month))
+                    monthly_record = await cursor.fetchone()
+
+                    current_monthly_count = monthly_record[0] if monthly_record else 0
+                    new_monthly_count = current_monthly_count + deer_count
+
+                    if new_monthly_count > self.monthly_max_checkins:
+                        yield event.plain_result(f"打卡失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
+                        return
 
         try:
             async with aiosqlite.connect(self.db_path) as conn:
@@ -114,6 +189,16 @@ class DeerCheckinPlugin(Star):
     @filter.regex(r'^🦌日历$')
     async def handle_calendar_command(self, event: AstrMessageEvent):
         """'🦌日历' 命令，只查询并发送用户的当月打卡日历。"""
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
         await self._ensure_initialized()
         user_name = event.get_sender_name()
         logger.info(f"用户 {user_name} ({event.get_sender_id()}) 使用命令查询日历。")
@@ -126,6 +211,16 @@ class DeerCheckinPlugin(Star):
         """
         处理补签命令，格式: '🦌补签 <日期> <次数>'
         """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
         await self._ensure_initialized()
 
         # 在函数内部，对消息原文进行正则搜索
@@ -136,7 +231,6 @@ class DeerCheckinPlugin(Star):
             logger.error("补签处理器被触发，但内部正则匹配失败！这不应该发生。")
             return
 
-        user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
         # 从 match 对象中解析日期和次数
@@ -170,6 +264,40 @@ class DeerCheckinPlugin(Star):
         target_date = date(current_year, current_month, day_to_checkin)
         target_date_str = target_date.strftime("%Y-%m-%d")
 
+        # 检查每日和每月计入次数限制（针对补签日期）
+        if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
+            # 查询当前日期和当前月份的打卡次数
+            async with aiosqlite.connect(self.db_path) as conn:
+                # 查询当日打卡次数
+                if self.daily_max_checkins > 0:
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, target_date_str))
+                    today_record = await cursor.fetchone()
+
+                    current_daily_count = today_record[0] if today_record else 0
+                    new_daily_count = current_daily_count + deer_count
+
+                    if new_daily_count > self.daily_max_checkins:
+                        yield event.plain_result(f"补签失败！{target_date_str} 当日计入次数已达上限 {self.daily_max_checkins} 次。")
+                        return
+
+                # 查询当月打卡次数
+                if self.monthly_max_checkins > 0:
+                    current_month = target_date_str[:7]  # YYYY-MM
+                    cursor = await conn.execute('''
+                        SELECT SUM(deer_count) FROM checkin
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?
+                    ''', (user_id, current_month))
+                    monthly_record = await cursor.fetchone()
+
+                    current_monthly_count = monthly_record[0] if monthly_record else 0
+                    new_monthly_count = current_monthly_count + deer_count
+
+                    if new_monthly_count > self.monthly_max_checkins:
+                        yield event.plain_result(f"补签失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
+                        return
+
         try:
             async with aiosqlite.connect(self.db_path) as conn:
                 await conn.execute('''
@@ -195,6 +323,15 @@ class DeerCheckinPlugin(Star):
         """
         响应 '🦌帮助' 命令，发送一个包含所有指令用法的菜单。
         """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
         help_text = (
             "--- 🦌打卡帮助菜单 ---\n\n"
             "1️⃣  **🦌打卡**\n"
