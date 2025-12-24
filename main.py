@@ -155,14 +155,24 @@ class DeerCheckinPlugin(Star):
                 # 查询当月打卡次数
                 if self.monthly_max_checkins > 0:
                     current_month = today_str[:7]  # YYYY-MM
+                    # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
                         SELECT SUM(deer_count) FROM checkin
-                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?
-                    ''', (user_id, current_month))
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ? AND checkin_date != ?
+                    ''', (user_id, current_month, today_str))
                     monthly_record = await cursor.fetchone()
 
                     current_monthly_count = monthly_record[0] if monthly_record else 0
-                    new_monthly_count = current_monthly_count + deer_count
+
+                    # 查询当天已有的数量
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, today_str))
+                    today_record = await cursor.fetchone()
+                    existing_count = today_record[0] if today_record else 0
+
+                    # 计算打卡后的总数
+                    new_monthly_count = current_monthly_count + existing_count + deer_count
 
                     if new_monthly_count > self.monthly_max_checkins:
                         yield event.plain_result(f"打卡失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
@@ -285,14 +295,24 @@ class DeerCheckinPlugin(Star):
                 # 查询当月打卡次数
                 if self.monthly_max_checkins > 0:
                     current_month = target_date_str[:7]  # YYYY-MM
+                    # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
                         SELECT SUM(deer_count) FROM checkin
-                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ?
-                    ''', (user_id, current_month))
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ? AND checkin_date != ?
+                    ''', (user_id, current_month, target_date_str))
                     monthly_record = await cursor.fetchone()
 
                     current_monthly_count = monthly_record[0] if monthly_record else 0
-                    new_monthly_count = current_monthly_count + deer_count
+
+                    # 查询目标日期已有的数量
+                    cursor = await conn.execute('''
+                        SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, target_date_str))
+                    today_record = await cursor.fetchone()
+                    existing_count = today_record[0] if today_record else 0
+
+                    # 计算补签后的总数
+                    new_monthly_count = current_monthly_count + existing_count + deer_count
 
                     if new_monthly_count > self.monthly_max_checkins:
                         yield event.plain_result(f"补签失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
