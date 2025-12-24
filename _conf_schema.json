@@ -40,5 +40,11 @@
         "hint": "启用后将提供专门的女性适用日历功能，需要特殊的计入数据方式（此功能暂未实现）",
         "type": "bool",
         "default": false
+    },
+    "ranking_display_count": {
+        "description": "排行展示用户数量",
+        "hint": "设置排行榜显示的用户数量，默认为10",
+        "type": "int",
+        "default": 10
     }
 }

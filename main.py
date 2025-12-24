@@ -34,6 +34,7 @@ class DeerCheckinPlugin(Star):
         self.daily_max_checkins = int(self.config.get("daily_max_checkins", 0))
         self.monthly_max_checkins = int(self.config.get("monthly_max_checkins", 0))
         self.enable_female_calendar = bool(self.config.get("enable_female_calendar", False))
+        self.ranking_display_count = int(self.config.get("ranking_display_count", 10))
 
         data_dir = StarTools.get_data_dir("astrbot_plugin_deer_check")
         os.makedirs(data_dir, exist_ok=True)
@@ -162,14 +163,14 @@ class DeerCheckinPlugin(Star):
                     ''', (user_id, current_month, today_str))
                     monthly_record = await cursor.fetchone()
 
-                    current_monthly_count = monthly_record[0] if monthly_record else 0
+                    current_monthly_count = monthly_record[0] if monthly_record and monthly_record[0] is not None else 0
 
                     # 查询当天已有的数量
                     cursor = await conn.execute('''
                         SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
                     ''', (user_id, today_str))
                     today_record = await cursor.fetchone()
-                    existing_count = today_record[0] if today_record else 0
+                    existing_count = today_record[0] if today_record and today_record[0] is not None else 0
 
                     # 计算打卡后的总数
                     new_monthly_count = current_monthly_count + existing_count + deer_count
@@ -302,14 +303,14 @@ class DeerCheckinPlugin(Star):
                     ''', (user_id, current_month, target_date_str))
                     monthly_record = await cursor.fetchone()
 
-                    current_monthly_count = monthly_record[0] if monthly_record else 0
+                    current_monthly_count = monthly_record[0] if monthly_record and monthly_record[0] is not None else 0
 
                     # 查询目标日期已有的数量
                     cursor = await conn.execute('''
                         SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?
                     ''', (user_id, target_date_str))
                     today_record = await cursor.fetchone()
-                    existing_count = today_record[0] if today_record else 0
+                    existing_count = today_record[0] if today_record and today_record[0] is not None else 0
 
                     # 计算补签后的总数
                     new_monthly_count = current_monthly_count + existing_count + deer_count
@@ -337,6 +338,113 @@ class DeerCheckinPlugin(Star):
         yield event.plain_result(f"补签成功！已为 {current_month}月{day_to_checkin}日 增加了 {deer_count} 个鹿。")
         async for result in self._generate_and_send_calendar(event):
             yield result
+
+    @filter.regex(r'^🦌排行$')
+    async def handle_deer_ranking(self, event: AstrMessageEvent):
+        """
+        响应 '🦌排行' 命令，生成并发送当前月度的打卡排行榜图片。
+        """
+        # 检查是否在群聊中
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用此功能！")
+            return
+
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        current_year = date.today().year
+        current_month = date.today().month
+        current_month_str = date.today().strftime("%Y-%m")
+
+        # 查询当月所有用户的打卡数据
+        all_users_data = []
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT user_id, SUM(deer_count) as total_deer FROM checkin WHERE strftime('%Y-%m', checkin_date) = ? GROUP BY user_id ORDER BY total_deer DESC",
+                    (current_month_str,)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        user_id, total_deer = row
+                        all_users_data.append((user_id, total_deer))
+        except Exception as e:
+            logger.error(f"查询当月排行榜数据失败: {e}")
+            yield event.plain_result("查询排行榜数据时出错了 >_<")
+            return
+
+        if not all_users_data:
+            yield event.plain_result("本月还没有任何打卡记录哦，快发送“🦌”开始打卡吧！")
+            return
+
+        # 获取当前群的所有成员
+        try:
+            group_members = await self._get_group_members(event, group_id)
+            if not group_members:
+                logger.warning(f"无法获取群 {group_id} 的成员列表")
+                # 如果无法获取群成员，返回所有数据但不建议使用
+                yield event.plain_result("无法获取群成员信息，无法生成排行榜。")
+                return
+        except Exception as e:
+            logger.error(f"获取群成员列表失败: {e}")
+            yield event.plain_result("获取群成员信息时出错了 >_<")
+            return
+
+        # 过滤出当前群的用户
+        group_user_ids = {member['user_id'] for member in group_members}
+        ranking_data = [(user_id, deer_count) for user_id, deer_count in all_users_data if user_id in group_user_ids]
+
+        # 只取前self.ranking_display_count名（默认10名）
+        ranking_display_count = getattr(self, 'ranking_display_count', 10)  # 默认显示10名
+        ranking_data = ranking_data[:ranking_display_count]
+
+        if not ranking_data:
+            yield event.plain_result("本月本群还没有任何打卡记录哦，快发送“🦌”开始打卡吧！")
+            return
+
+        # 获取用户昵称
+        user_names = []
+        for user_id, _ in ranking_data:
+            try:
+                user_name = await self._get_user_name(event, user_id)
+                user_names.append(user_name)
+            except Exception:
+                user_names.append(f"用户{user_id}")
+
+        # 生成排行榜图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self._create_ranking_image,
+                user_names,
+                ranking_data,
+                current_year,
+                current_month
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成排行榜图片。")
+            ranking_text = f"🦌{current_year}年{current_month}月打卡排行榜:\n"
+            for i, (user_name, deer_count) in enumerate(zip(user_names, [data[1] for data in ranking_data]), 1):
+                ranking_text += f"{i}. {user_name}: {deer_count}次\n"
+            yield event.plain_result(ranking_text)
+        except Exception as e:
+            logger.error(f"生成或发送排行榜图片失败: {e}")
+            yield event.plain_result("处理排行榜图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
     @filter.regex(r'^🦌帮助$')
     async def handle_help_command(self, event: AstrMessageEvent):
@@ -371,6 +479,104 @@ class DeerCheckinPlugin(Star):
         )
 
         yield event.plain_result(help_text)
+
+    async def _get_group_members(self, event: AstrMessageEvent, group_id: str) -> list:
+        """获取群成员列表"""
+        try:
+            if event.get_platform_name() == "aiocqhttp":
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+                if isinstance(event, AiocqhttpMessageEvent):
+                    client = event.bot
+                    members_info = await client.api.call_action('get_group_member_list', group_id=int(group_id))
+                    return members_info if members_info else []
+            return []
+        except Exception as e:
+            logger.error(f"获取群成员列表失败: {e}")
+            return []
+
+    async def _get_user_name(self, event: AstrMessageEvent, user_id: str) -> str:
+        """获取用户昵称"""
+        # 从 AstrMessageEvent 获取用户昵称
+        try:
+            # 如果是cqhttp平台
+            if event.get_platform_name() == "aiocqhttp":
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+                if isinstance(event, AiocqhttpMessageEvent):
+                    group_id = event.get_group_id()
+                    if group_id:
+                        member_info = await event.bot.get_group_member_info(
+                            group_id=int(group_id), user_id=int(user_id)
+                        )
+                        nickname = member_info.get("card") or member_info.get("nickname")
+                        return nickname.strip() or str(user_id)
+                    else:
+                        stranger_info = await event.bot.get_stranger_info(user_id=int(user_id))
+                        return stranger_info.get("nickname") or str(user_id)
+            return str(user_id)
+        except Exception:
+            return str(user_id)
+
+    def _create_ranking_image(self, user_names: list, ranking_data: list, year: int, month: int) -> str:
+        """
+        绘制月度打卡排行榜图片
+        """
+        WIDTH, HEIGHT = 700, 600
+        BG_COLOR = (255, 255, 255)
+        HEADER_COLOR = (50, 50, 50)
+        RANK_COLOR = (100, 100, 100)
+        NAME_COLOR = (80, 80, 80)
+        COUNT_COLOR = (139, 69, 19)
+        TOP3_BG_COLOR = [(255, 215, 0), (220, 220, 220), (205, 133, 63)]  # 金银铜牌背景
+
+        try:
+            font_header = ImageFont.truetype(self.font_path, 32)
+            font_rank = ImageFont.truetype(self.font_path, 24)
+            font_name = ImageFont.truetype(self.font_path, 20)
+            font_count = ImageFont.truetype(self.font_path, 22)
+        except FileNotFoundError as e:
+            logger.error(f"字体文件加载失败: {e}")
+            raise e
+
+        img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # 绘制标题
+        header_text = f"{year}年{month}月🦌打卡排行榜"
+        draw.text((WIDTH / 2, 30), header_text, font=font_header, fill=HEADER_COLOR, anchor="mt")
+
+        # 绘制排行榜项
+        item_height = 50
+        start_y = 100
+        for i, ((user_id, deer_count), user_name) in enumerate(zip(ranking_data, user_names)):
+            y_pos = start_y + i * item_height
+
+            # 为前三名设置特殊背景
+            if i < 3:
+                bg_color = TOP3_BG_COLOR[i]
+                draw.rectangle([50, y_pos - 10, WIDTH - 50, y_pos + item_height - 10], fill=bg_color)
+
+            # 绘制排名
+            rank_text = f"{i+1}."
+            if i == 0:
+                rank_color = (255, 215, 0)  # 金牌色
+            elif i == 1:
+                rank_color = (169, 169, 169)  # 银牌色
+            elif i == 2:
+                rank_color = (139, 69, 19)   # 铜牌色
+            else:
+                rank_color = RANK_COLOR
+            draw.text((80, y_pos + item_height / 2), rank_text, font=font_rank, fill=rank_color, anchor="lm")
+
+            # 绘制用户名
+            draw.text((150, y_pos + item_height / 2), user_name, font=font_name, fill=NAME_COLOR, anchor="lm")
+
+            # 绘制打卡次数
+            count_text = f"{deer_count}次"
+            draw.text((WIDTH - 100, y_pos + item_height / 2), count_text, font=font_count, fill=COUNT_COLOR, anchor="rm")
+
+        file_path = os.path.join(self.temp_dir, f"ranking_{year}_{month}_{int(time.time())}.png")
+        img.save(file_path, format='PNG')
+        return file_path
 
     def _create_calendar_image(self, user_id: str, user_name: str, year: int, month: int, checkin_data: dict, total_deer: int) -> str:
         """
