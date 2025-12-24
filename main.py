@@ -9,7 +9,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.star import StarTools
-from resources.deer_core import DeerCore
+from .resources.deer_core import DeerCore
 
 FONT_FILE = "font.ttf"
 DB_NAME = "deer_checkin.db"
