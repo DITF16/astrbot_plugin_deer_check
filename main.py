@@ -458,6 +458,87 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
+    @filter.regex(r'^🦌年历$')
+    async def handle_yearly_calendar(self, event: AstrMessageEvent):
+        """
+        响应 '🦌年历' 命令，生成并发送今年的完整打卡日历图片。
+        """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        from datetime import datetime
+        current_year = datetime.now().year
+        user_name = event.get_sender_name()
+
+        logger.info(f"用户 {user_name} ({user_id}) 请求查看 {current_year}年的年历。")
+
+        # 查询今年所有月份的打卡记录
+        yearly_data = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                async with conn.execute(
+                    "SELECT checkin_date, deer_count FROM checkin WHERE user_id = ? AND strftime('%Y', checkin_date) = ?",
+                    (user_id, str(current_year))
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        yield event.plain_result(f"您在{current_year}年还没有打卡记录哦，发送“🦌”开始打卡吧！")
+                        return
+
+                    for row in rows:
+                        date_str = row[0]
+                        count = row[1]
+                        year, month, day = date_str.split('-')
+                        month = int(month)
+                        day = int(day)
+
+                        if month not in yearly_data:
+                            yearly_data[month] = {}
+                        yearly_data[month][day] = count
+        except Exception as e:
+            logger.error(f"查询用户 {user_name} ({user_id}) 的 {current_year}年数据失败: {e}")
+            yield event.plain_result("查询年历数据时出错了 >_<")
+            return
+
+        # 生成并发送年历图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self._create_yearly_calendar_image,
+                user_id,
+                user_name,
+                current_year,
+                yearly_data
+            )
+            yield event.image_result(image_path)
+        except FileNotFoundError:
+            logger.error(f"字体文件未找到！无法生成年历图片。")
+            # 生成文本总结
+            total_months = len(yearly_data)
+            total_days = sum(len(days) for days in yearly_data.values())
+            total_deer = sum(sum(days.values()) for days in yearly_data.values())
+            yield event.plain_result(
+                f"服务器缺少字体文件，无法生成年历图片。{current_year}年您已打卡{total_months}个月，{total_days}天，累计{total_deer}个🦌。")
+        except Exception as e:
+            logger.error(f"生成或发送年历图片失败: {e}")
+            yield event.plain_result("处理年历图片时发生了未知错误 >_<")
+        finally:
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌月历\s+(\d{1,2})$')
     async def handle_specific_month_calendar(self, event: AstrMessageEvent):
         """
@@ -582,15 +663,18 @@ class DeerCheckinPlugin(Star):
             "2️⃣  **查看记录**\n"
             "    ▸ **命令**: `🦌日历`\n"
             "    ▸ **作用**: 查看您本月的打卡日历，不记录打卡。\n\n"
-            "3️⃣  **查看指定月份记录**\n"
+            "3️⃣  **查看年度记录**\n"
+            "    ▸ **命令**: `🦌年历`\n"
+            "    ▸ **作用**: 查看您本年度的完整打卡日历，不记录打卡。\n\n"
+            "4️⃣  **查看指定月份记录**\n"
             "    ▸ **命令**: `🦌月历 月份数字`\n"
             "    ▸ **作用**: 查看指定月份的打卡日历，不记录打卡。\n"
             "    ▸ **示例**: `🦌月历 11` (查看11月的日历)\n\n"
-            "4️⃣  **补签**\n"
+            "5️⃣  **补签**\n"
             "    ▸ **命令**: `🦌补签 [日期] [次数]`\n"
             "    ▸ **作用**: 为本月指定日期补上打卡记录。\n"
             "    ▸ **示例**: `🦌补签 1 5` (为本月1号补签5次)\n\n"
-            "5️⃣  **显示此帮助**\n"
+            "6️⃣  **显示此帮助**\n"
             "    ▸ **命令**: `🦌帮助`\n\n"
             "祝您一🦌顺畅！"
         )
@@ -706,6 +790,132 @@ class DeerCheckinPlugin(Star):
         draw.text((WIDTH / 2, HEIGHT - 30), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
 
         file_path = os.path.join(self.temp_dir, f"ranking_{year}_{month}_{int(time.time())}.png")
+        img.save(file_path, format='PNG')
+        return file_path
+
+    def _create_yearly_calendar_image(self, user_id: str, user_name: str, year: int, yearly_data: dict) -> str:
+        """
+        绘制年度打卡日历图片，将12个月的日历按网格排列
+        """
+        from datetime import date
+        import calendar
+
+        # 显示从1月到当前月份（未来月份不显示）
+        from datetime import datetime
+        current_month = datetime.now().month
+        months_to_show = current_month  # 显示1月到当前月份
+
+        # 定义每行显示的月份数量
+        months_per_row = 3
+        rows_needed = (months_to_show + months_per_row - 1) // months_per_row  # 向上取整
+
+        # 定义单个月历的尺寸
+        single_cal_width = 200
+        single_cal_height = 180
+        header_height = 30
+        margin = 20
+
+        # 计算整体图片尺寸
+        img_width = months_per_row * single_cal_width + (months_per_row + 1) * margin
+        img_height = rows_needed * single_cal_height + (rows_needed + 1) * margin + 50  # 额外空间用于标题
+
+        BG_COLOR = (255, 255, 255)
+        HEADER_COLOR = (50, 50, 50)
+        WEEKDAY_COLOR = (100, 100, 100)
+        DAY_COLOR = (80, 80, 80)
+        TODAY_BG_COLOR = (240, 240, 255)
+        CHECKIN_MARK_COLOR = (0, 150, 50)
+        DEER_COUNT_COLOR = (139, 69, 19)
+
+        try:
+            font_header = ImageFont.truetype(self.font_path, 24)
+            font_weekday = ImageFont.truetype(self.font_path, 10)
+            font_day = ImageFont.truetype(self.font_path, 12)
+            font_check_mark = ImageFont.truetype(self.font_path, 14)
+            font_deer_count = ImageFont.truetype(self.font_path, 8)
+            font_summary = ImageFont.truetype(self.font_path, 18)
+        except FileNotFoundError as e:
+            logger.error(f"字体文件加载失败: {e}")
+            raise e
+
+        img = Image.new('RGB', (img_width, img_height), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # 绘制标题
+        header_text = f"{year}年 - {user_name}的鹿年历"
+        draw.text((img_width / 2, 20), header_text, font=font_header, fill=HEADER_COLOR, anchor="mt")
+
+        # 绘制每个月的日历
+        for i, month in enumerate(range(1, months_to_show + 1)):
+            row = i // months_per_row
+            col = i % months_per_row
+
+            # 计算这个月历的左上角坐标
+            x_offset = margin + col * (single_cal_width + margin)
+            y_offset = 50 + margin + row * (single_cal_height + margin)
+
+            # 绘制月份标题
+            month_text = f"{month}月"
+            draw.text((x_offset + single_cal_width / 2, y_offset), month_text, font=font_weekday, fill=HEADER_COLOR, anchor="mt")
+
+            # 绘制星期标题
+            weekdays = ["一", "二", "三", "四", "五", "六", "日"]
+            day_width = single_cal_width // 7
+            for j, day in enumerate(weekdays):
+                draw.text(
+                    (x_offset + j * day_width + day_width / 2, y_offset + header_height),
+                    day,
+                    font=font_weekday,
+                    fill=WEEKDAY_COLOR,
+                    anchor="mm"
+                )
+
+            # 绘制日期
+            cal = calendar.monthcalendar(year, month)
+            current_date = date.today()
+            today_num = current_date.day if current_date.year == year and current_date.month == month else 0
+
+            for week_idx, week in enumerate(cal):
+                for day_idx, day_num in enumerate(week):
+                    if day_num == 0:  # 0表示不属于当前月的日期
+                        continue
+
+                    day_x = x_offset + day_idx * day_width
+                    day_y = y_offset + header_height + 15 + week_idx * 20  # 15是星期标题高度，20是行间距
+
+                    # 如果是今天，绘制淡蓝色背景
+                    if day_num == today_num and month == current_date.month:
+                        draw.rectangle(
+                            [day_x, day_y - 8, day_x + day_width, day_y + 8],
+                            fill=TODAY_BG_COLOR
+                        )
+
+                    # 检查是否有打卡记录
+                    if month in yearly_data and day_num in yearly_data[month]:
+                        deer_count = yearly_data[month][day_num]
+                        # 有打卡的日期使用红色
+                        day_color = (255, 0, 0)  # 红色
+                        # 绘制 '鹿' 数量
+                        deer_text = f"{deer_count}"
+                        draw.text(
+                            (day_x + day_width / 2, day_y + 8),
+                            deer_text, font=font_deer_count, fill=DEER_COUNT_COLOR, anchor="mm"
+                        )
+                    else:
+                        # 没有打卡的日期使用普通颜色
+                        day_color = DAY_COLOR
+
+                    # 绘制日期数字
+                    draw.text((day_x + day_width / 2, day_y), str(day_num), font=font_day, fill=day_color, anchor="mm")
+
+        # 添加底部总结
+        total_months = len(yearly_data)
+        total_days = sum(len(days) for days in yearly_data.values())
+        total_deer = sum(sum(days.values()) for days in yearly_data.values())
+        summary_text = f"年度总结：{year}年累计打卡{total_months}个月，{total_days}天，共{total_deer}次"
+        draw.text((img_width / 2, img_height - 20), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
+
+        file_path = os.path.join(self.temp_dir, f"yearly_calendar_{user_id}_{int(time.time())}.png")
         img.save(file_path, format='PNG')
         return file_path
 
