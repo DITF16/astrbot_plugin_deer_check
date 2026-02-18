@@ -48,7 +48,6 @@ class DeerCheckinPlugin(Star):
         self.temp_dir = os.path.join(plugin_dir, "tmp")
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        # Initialize the core utility classes
         self.deer_core = DeerCore(self.font_path, self.deer_db_path, self.temp_dir)
         self.klittra_core = KlittraCore(self.font_path, self.klittra_db_path, self.temp_dir)
 
@@ -99,6 +98,23 @@ class DeerCheckinPlugin(Star):
             logger.info("扣日历数据库初始化成功。")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
+
+    def _get_adjusted_date(self, current_time: datetime) -> str:
+        """根据配置的 day_start_time 获取调整后的日期字符串 (YYYY-MM-DD)"""
+        # 解析HH:MM格式的时间
+        try:
+            hour, minute = map(int, self.day_start_time.split(':'))
+            day_start_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except (ValueError, AttributeError):
+            # 如果格式不正确，默认使用00:00
+            day_start_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # 如果当前时间小于设置的每天开始时间，则认为是前一天
+        if current_time.time() < day_start_time.time():
+            adjusted_date = current_time - timedelta(days=1)
+        else:
+            adjusted_date = current_time
+        return adjusted_date.strftime("%Y-%m-%d")
 
     async def _monthly_cleanup(self):
         """检查是否进入新月份，如果是则清空旧数据（根据配置决定）"""
@@ -154,21 +170,7 @@ class DeerCheckinPlugin(Star):
         deer_count = event.message_str.count("🦌")
 
         current_time = datetime.now()
-
-        # 解析HH:MM格式的时间
-        try:
-            hour, minute = map(int, self.day_start_time.split(':'))
-            day_start_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        except (ValueError, AttributeError):
-            # 如果格式不正确，默认使用00:00
-            day_start_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        # 如果当前时间小于设置的每天开始时间，则认为是前一天
-        if current_time.time() < day_start_time.time():
-            adjusted_date = current_time - timedelta(days=1)
-        else:
-            adjusted_date = current_time
-        today_str = adjusted_date.strftime("%Y-%m-%d")
+        today_str = self._get_adjusted_date(current_time)
 
         # 检查每日和每月计入次数限制
         if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
@@ -190,7 +192,7 @@ class DeerCheckinPlugin(Star):
 
                 # 查询当月打卡次数
                 if self.monthly_max_checkins > 0:
-                    current_month = today_str[:7]  # YYYY-MM
+                    current_month = today_str[:7]  # YYYY-MM 格式
                     # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
                         SELECT SUM(deer_count) FROM checkin
@@ -254,21 +256,7 @@ class DeerCheckinPlugin(Star):
         pinch_count = event.message_str.count("🤏")
 
         current_time = datetime.now()
-
-        # 解析HH:MM格式的时间
-        try:
-            hour, minute = map(int, self.day_start_time.split(':'))
-            day_start_time = current_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        except (ValueError, AttributeError):
-            # 如果格式不正确，默认使用00:00
-            day_start_time = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        # 如果当前时间小于设置的每天开始时间，则认为是前一天
-        if current_time.time() < day_start_time.time():
-            adjusted_date = current_time - timedelta(days=1)
-        else:
-            adjusted_date = current_time
-        today_str = adjusted_date.strftime("%Y-%m-%d")
+        today_str = self._get_adjusted_date(current_time)
 
         # 检查每日和每月计入次数限制（复用 deer 的限制配置）
         if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
@@ -290,7 +278,7 @@ class DeerCheckinPlugin(Star):
 
                 # 查询当月打卡次数
                 if self.monthly_max_checkins > 0:
-                    current_month = today_str[:7]  # YYYY-MM
+                    current_month = today_str[:7]  # YYYY-MM 格式
                     # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
                         SELECT SUM(klittra_count) FROM klittra_checkin
@@ -345,7 +333,7 @@ class DeerCheckinPlugin(Star):
         if image_path:
             yield event.image_result(image_path)
 
-        # Clean up the image file
+        # 删除临时图片文件
         if image_path and os.path.exists(image_path):
             try:
                 await asyncio.to_thread(os.remove, image_path)
@@ -446,10 +434,10 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
-    @filter.regex(r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$')
+    @filter.regex(r'^🦌补签\s+(\d{1,2})(?:\s+(\d+))?\s*$')
     async def handle_retro_checkin(self, event: AstrMessageEvent):
         """
-        处理补签命令，格式: '🦌补签 <日期> <次数>'
+        处理补签命令，格式: '🦌补签 <日期> [次数]'
         """
         # 检查群组白名单和用户黑名单
         group_id = event.get_group_id()
@@ -464,7 +452,7 @@ class DeerCheckinPlugin(Star):
         await self._ensure_initialized()
 
         # 在函数内部，对消息原文进行正则搜索
-        pattern = r'^🦌补签\s+(\d{1,2})\s+(\d+)\s*$'
+        pattern = r'^🦌补签\s+(\d{1,2})(?:\s+(\d+))?\s*$'
         match = re.search(pattern, event.message_str)
 
         if not match:
@@ -477,12 +465,12 @@ class DeerCheckinPlugin(Star):
         try:
             day_str, count_str = match.groups()
             day_to_checkin = int(day_str)
-            deer_count = int(count_str)
+            deer_count = int(count_str) if count_str else 1
             if deer_count <= 0:
                 yield event.plain_result("补签次数必须是大于0的整数哦！")
                 return
         except (ValueError, TypeError):
-            yield event.plain_result("命令格式不正确，请使用：🦌补签 日期 次数 (例如：🦌补签 1 5)")
+            yield event.plain_result("命令格式不正确，请使用：🦌补签 日期 [次数] (例如：🦌补签 1 5 或 🦌补签 1)")
             return
 
         # 验证日期有效性
@@ -524,7 +512,7 @@ class DeerCheckinPlugin(Star):
 
                 # 查询当月打卡次数
                 if self.monthly_max_checkins > 0:
-                    current_month = target_date_str[:7]  # YYYY-MM
+                    current_month = target_date_str[:7]  # YYYY-MM 格式
                     # 查询本月其他日期的总次数
                     cursor = await conn.execute('''
                         SELECT SUM(deer_count) FROM checkin
@@ -567,6 +555,359 @@ class DeerCheckinPlugin(Star):
         yield event.plain_result(f"补签成功！已为 {current_month}月{day_to_checkin}日 增加了 {deer_count} 个鹿。")
         async for result in self._generate_and_send_calendar(event):
             yield result
+
+    @filter.regex(r'^🦌撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$')
+    async def handle_undo_checkin(self, event: AstrMessageEvent):
+        """
+        处理撤销命令，格式: '🦌撤销 <日期> [次数]'
+        """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        # 在函数内部，对消息原文进行正则搜索
+        pattern = r'^🦌撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$'
+        match = re.search(pattern, event.message_str)
+
+        if not match:
+            logger.error("撤销处理器被触发，但内部正则匹配失败！这不应该发生。")
+            return
+
+        user_name = event.get_sender_name()
+
+        # 从 match 对象中解析日期和次数
+        try:
+            day_str, count_str = match.groups()
+            day_to_checkin = int(day_str)
+            deer_count = int(count_str) if count_str else 1
+            if deer_count <= 0:
+                yield event.plain_result("撤销次数必须是大于0的整数哦！")
+                return
+        except (ValueError, TypeError):
+            yield event.plain_result("命令格式不正确，请使用：🦌撤销 日期 [次数] (例如：🦌撤销 1 5 或 🦌撤销 1)")
+            return
+
+        # 验证日期有效性
+        today = date.today()
+        current_year = today.year
+        current_month = today.month
+
+        days_in_month = calendar.monthrange(current_year, current_month)[1]
+
+        if not (1 <= day_to_checkin <= days_in_month):
+            yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
+            return
+
+        if day_to_checkin > today.day:
+            yield event.plain_result("抱歉，不能对未来进行撤销哦！")
+            return
+
+        # 数据库操作
+        target_date = date(current_year, current_month, day_to_checkin)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+
+        try:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
+                # 查询当前记录
+                cursor = await conn.execute("SELECT deer_count FROM checkin WHERE user_id = ? AND checkin_date = ?", (user_id, target_date_str))
+                record = await cursor.fetchone()
+                
+                if not record or record[0] < deer_count:
+                    current_count = record[0] if record else 0
+                    yield event.plain_result(f"撤销失败！{target_date_str} 的打卡次数仅为 {current_count}，不足以减少 {deer_count} 次。")
+                    return
+                
+                # 执行更新
+                new_count = record[0] - deer_count
+                if new_count == 0:
+                    await conn.execute("DELETE FROM checkin WHERE user_id = ? AND checkin_date = ?", (user_id, target_date_str))
+                else:
+                    await conn.execute("UPDATE checkin SET deer_count = ? WHERE user_id = ? AND checkin_date = ?", (new_count, user_id, target_date_str))
+                await conn.commit()
+            
+            logger.info(f"用户 {user_name} ({user_id}) 成功为 {target_date_str} 撤销了 {deer_count} 个🦌。")
+        except Exception as e:
+            logger.error(f"为用户 {user_name} ({user_id}) 撤销失败: {e}")
+            yield event.plain_result("撤销失败，数据库出错了 >_<")
+            return
+
+        # 发送成功提示，并返回更新后的日历图片
+        yield event.plain_result(f"撤销成功！已为 {current_month}月{day_to_checkin}日 减少了 {deer_count} 个鹿。")
+        async for result in self._generate_and_send_calendar(event):
+            yield result
+
+    @filter.regex(r'^🦌生涯$')
+    async def handle_deer_career(self, event: AstrMessageEvent):
+        """
+        响应 '🦌生涯' 命令，生成并发送用户的生涯统计报告。
+        """
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+        user_name = event.get_sender_name()
+        
+        # 获取当前调整后的日期
+        current_time = datetime.now()
+        today_str = self._get_adjusted_date(current_time)
+        today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+
+        try:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
+                # 1. 基础数据查询
+                cursor = await conn.execute('''
+                    SELECT 
+                        MIN(checkin_date), 
+                        COUNT(DISTINCT checkin_date), 
+                        SUM(deer_count),
+                        MAX(checkin_date)
+                    FROM checkin WHERE user_id = ?
+                ''', (user_id,))
+                first_date_str, total_days, total_count, last_date_str = await cursor.fetchone()
+
+                if not first_date_str:
+                    yield event.plain_result("您还没有任何打卡记录，发送“🦌”开始您的生涯吧！")
+                    return
+
+                first_date = datetime.strptime(first_date_str, "%Y-%m-%d").date()
+                total_span_days = (today_date - first_date).days + 1  # 累计时光
+                
+                # 日均发射 (按总跨度天数)
+                daily_avg = total_count / total_span_days if total_span_days else 0
+                
+                # 活跃占比 (动手天数 / 生涯总天数)
+                active_ratio = (total_days / total_span_days) * 100 if total_span_days else 0
+
+                # 2. 巅峰时刻 & 贤者时期
+                # 先获取所有月份的数据，找出 0 记录的月份
+                cursor = await conn.execute('''
+                    SELECT strftime('%Y-%m', checkin_date) as month, SUM(deer_count) as total 
+                    FROM checkin WHERE user_id = ? 
+                    GROUP BY month
+                ''', (user_id,))
+                month_data = await cursor.fetchall()
+                month_dict = {row[0]: row[1] for row in month_data}
+
+                # 生成从 first_date 到 today_date 的所有月份
+                all_months = []
+                curr = first_date.replace(day=1)
+                end_curr = today_date.replace(day=1)
+                while curr <= end_curr:
+                    all_months.append(curr.strftime("%Y-%m"))
+                    # 下个月
+                    if curr.month == 12:
+                        curr = curr.replace(year=curr.year + 1, month=1)
+                    else:
+                        curr = curr.replace(month=curr.month + 1)
+                
+                # 填充 0 记录月份
+                full_month_data = []
+                for m in all_months:
+                    count = month_dict.get(m, 0)
+                    full_month_data.append((m, count))
+                
+                # 重新计算月度之最 (其实DB查出来的就是最大的，除非全是0)
+                if full_month_data:
+                    full_month_data.sort(key=lambda x: x[1], reverse=True)
+                    max_month_str, max_month_count = full_month_data[0]
+                    
+                    full_month_data.sort(key=lambda x: x[1]) # 升序
+                    min_month_str, min_month_count = full_month_data[0] # 最小的 (可能是0)
+                else:
+                    max_month_str, max_month_count = "N/A", 0
+                    min_month_str, min_month_count = "N/A", 0
+
+                # 单日之最
+                cursor = await conn.execute('''
+                    SELECT checkin_date, deer_count FROM checkin 
+                    WHERE user_id = ? ORDER BY deer_count DESC, checkin_date DESC LIMIT 1
+                ''', (user_id,))
+                max_day_record = await cursor.fetchone()
+                max_day_date = max_day_record[0]
+                max_day_count = max_day_record[1]
+
+                # 最长休养期 (连续未打卡)
+                # 获取所有打卡日期并排序
+                cursor = await conn.execute('''
+                    SELECT DISTINCT checkin_date FROM checkin WHERE user_id = ? ORDER BY checkin_date ASC
+                ''', (user_id,))
+                all_dates = await cursor.fetchall()
+                date_objs = [datetime.strptime(row[0], "%Y-%m-%d").date() for row in all_dates]
+
+                max_gap = 0
+                gap_start = None
+                gap_end = None
+
+                # 检查所有间隔
+                for i in range(len(date_objs) - 1):
+                    d1 = date_objs[i]
+                    d2 = date_objs[i+1]
+                    gap = (d2 - d1).days - 1
+                    if gap > max_gap:
+                        max_gap = gap
+                        gap_start = d1 + timedelta(days=1)
+                        gap_end = d2 - timedelta(days=1)
+                
+                # 还要检查最后一次打卡到今天的间隔 (如果今天没打卡)
+                last_checkin_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                days_since_last = (today_date - last_checkin_date).days
+                
+                if days_since_last > 0:
+                    current_gap = days_since_last # 昨天也没打的话
+                    # days_since_last = 1 (昨天打卡), gap = 0
+                    if days_since_last - 1 > max_gap:
+                        max_gap = days_since_last - 1
+                        gap_start = last_checkin_date + timedelta(days=1)
+                        gap_end = today_date - timedelta(days=1) # 直到昨天
+
+                rest_period_str = f"{max_gap} 天"
+                if max_gap > 0 and gap_start and gap_end:
+                    rest_period_str += f" ({gap_start.strftime('%Y-%m-%d')} ~ {gap_end.strftime('%Y-%m-%d')})"
+                elif max_gap == 0:
+                    rest_period_str = "0 天 (全勤特种兵)"
+
+                # 生成贤者时刻评语
+                sage_comment = ""
+                if max_gap > 180:
+                    sage_comment = "可以去医院挂号了"
+                elif max_gap >= 91:
+                    sage_comment = "戒色吧黄牌选手"
+                elif max_gap >= 31:
+                    sage_comment = "设备已生锈，急需保养"
+                elif max_gap >= 15:
+                    sage_comment = "已经开始戒色文学创作了是吧"
+                elif max_gap >= 8:
+                    sage_comment = "没有那种世俗的欲望"
+                elif max_gap >= 0:
+                    sage_comment = "你连一周都憋不住？"
+                
+                # 4. 当前状态
+                status_day = days_since_last
+                
+                # 生成当前状态评语
+                status_comment = ""
+                if status_day == 0:
+                    status_comment = "别停，男人不能说不行"
+                elif status_day == 1:
+                    status_comment = "年轻人要好好把握当下"
+                elif 2 <= status_day <= 3:
+                    status_comment = "三天不练，手生；三天不鹿，心痒"
+                elif 4 <= status_day <= 7:
+                    status_comment = "小鹿怡情啊兄弟"
+                elif 8 <= status_day <= 14:
+                    status_comment = "你的国产欧美在等你宠幸"
+                elif 15 <= status_day <= 21:
+                    status_comment = "半个月了，这还能忍？"
+                elif 22 <= status_day <= 30:
+                    status_comment = "一个月没碰，你还是男人吗"
+                elif status_day > 30:
+                    status_comment = "阳痿直说"
+
+                # 5. 阶段性总结 (基于活跃占比和总次数)
+                summary_comment = ""
+                
+                # 优先判断极端数据
+                if total_count >= 2000:
+                    summary_comment = "陆地神仙"
+                elif total_count >= 1000:
+                    if active_ratio > 60:
+                        summary_comment = "鹿是我此生唯一的信仰"
+                    else:
+                        summary_comment = "无他，唯手熟尔"
+                
+                # 高频玩家
+                elif active_ratio > 80 and total_span_days > 30:
+                    summary_comment = "一天不鹿，浑身难受"
+                elif active_ratio > 50 and total_span_days > 30:
+                    summary_comment = "两天不鹿，留之何用"
+                
+                # 资深玩家
+                elif total_count >= 500:
+                    summary_comment = "阅片无数，心中无码"
+                elif total_count >= 200:
+                    if max_gap > 30:
+                        summary_comment = "自律使人成功"
+                    else:
+                        summary_comment = "劳模典范"
+                
+                # 特殊/佛系
+                elif total_span_days > 365 and total_count < 20:
+                    summary_comment = "我的剑不轻易出鞘"
+                elif active_ratio < 5 and total_span_days > 90:
+                    summary_comment = "戒色！"
+                
+                # 萌新
+                elif total_count < 10:
+                    summary_comment = "少年始知鹿滋味"
+                elif total_count < 50:
+                    summary_comment = "任重而道远"
+                
+                # 兜底
+                else:
+                    summary_comment = "同志还需努力"
+
+        except Exception as e:
+            logger.error(f"生成生涯报告数据失败: {e}")
+            yield event.plain_result("生成生涯报告时出错了 >_<")
+            return
+
+        # 准备数据给绘图函数
+        stats = {
+            "first_date_str": first_date_str,
+            "total_span_days": total_span_days,
+            "total_count": total_count,
+            "total_days": total_days,
+            "daily_avg": daily_avg,
+            "active_ratio": active_ratio,
+            "max_day_date": max_day_date,
+            "max_day_count": max_day_count,
+            "max_month_str": max_month_str,
+            "max_month_count": max_month_count,
+            "min_month_str": min_month_str,
+            "min_month_count": min_month_count,
+            "rest_period_str": rest_period_str,
+            "sage_comment": sage_comment,
+            "status_day": status_day,
+            "status_comment": status_comment,
+            "summary_comment": summary_comment
+        }
+
+        # 生成图片
+        image_path = ""
+        try:
+            image_path = await asyncio.to_thread(
+                self.deer_core._create_career_image,
+                user_name,
+                stats
+            )
+            # 发送图片
+            yield event.image_result(image_path)
+        except Exception as e:
+            logger.error(f"生成生涯图片失败: {e}")
+            yield event.plain_result("生成生涯图片失败 >_<")
+        finally:
+            # 删除临时图片文件
+            if image_path and os.path.exists(image_path):
+                try:
+                    await asyncio.to_thread(os.remove, image_path)
+                    logger.debug(f"已成功删除临时图片: {image_path}")
+                except OSError as e:
+                    logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
     @filter.regex(r'^🦌排行$')
     async def handle_deer_ranking(self, event: AstrMessageEvent):
@@ -762,7 +1103,7 @@ class DeerCheckinPlugin(Star):
         elif len(param) == 4:  # 年份
             try:
                 target_year = int(param)
-                current_year = datetime.now().year  # Use datetime instead of date
+                current_year = datetime.now().year
                 if target_year > current_year:
                     yield event.plain_result("年份不能超过当前年份哦！")
                     return
@@ -814,10 +1155,11 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
-    @filter.regex(r'^🦌年历$')
+    @filter.regex(r'^🦌年历(?:\s+(\d{4}))?$')
     async def handle_yearly_calendar(self, event: AstrMessageEvent):
         """
-        响应 '🦌年历' 命令，生成并发送今年的完整打卡日历图片。
+        响应 '🦌年历' 命令，生成并发送指定年份的完整打卡日历图片。
+        不带参数默认当年。
         """
         # 检查群组白名单和用户黑名单
         group_id = event.get_group_id()
@@ -831,7 +1173,17 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
+        # 解析年份参数
+        pattern = r'^🦌年历(?:\s+(\d{4}))?$'
+        match = re.search(pattern, event.message_str)
+        
         current_year = datetime.now().year
+        if match and match.group(1):
+            try:
+                current_year = int(match.group(1))
+            except ValueError:
+                pass  # 如果解析失败，回退到当前年份
+
         user_name = event.get_sender_name()
 
         logger.info(f"用户 {user_name} ({user_id}) 请求查看 {current_year}年的年历。")
@@ -894,10 +1246,11 @@ class DeerCheckinPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
-    @filter.regex(r'^🤏年历$')
+    @filter.regex(r'^🤏年历(?:\s+(\d{4}))?$')
     async def handle_klittra_yearly_calendar(self, event: AstrMessageEvent):
         """
-        响应 '🤏年历' 命令，生成并发送今年的完整扣日历图片。
+        响应 '🤏年历' 命令，生成并发送指定年份的完整扣日历图片。
+        不带参数默认当年。
         """
         # 检查是否启用了扣日历功能
         if not self.enable_female_calendar:
@@ -915,7 +1268,17 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
 
+        # 解析年份参数
+        pattern = r'^🤏年历(?:\s+(\d{4}))?$'
+        match = re.search(pattern, event.message_str)
+        
         current_year = datetime.now().year
+        if match and match.group(1):
+            try:
+                current_year = int(match.group(1))
+            except ValueError:
+                pass  # 如果解析失败，回退到当前年份
+
         user_name = event.get_sender_name()
 
         logger.info(f"用户 {user_name} ({user_id}) 请求查看 {current_year}年的扣年历。")
@@ -1315,30 +1678,38 @@ class DeerCheckinPlugin(Star):
             return  # 黑名单用户不处理
         help_text = (
             "--- 🦌打卡帮助菜单 ---\n\n"
-            "1️⃣  **🦌打卡**\n"
-            "    ▸ **命令**: 直接发送 🦌 (可发送多个)\n"
-            "    ▸ **作用**: 记录今天🦌的数量。\n"
-            "    ▸ **示例**: `🦌🦌🦌`\n\n"
-            "2️⃣  **查看记录**\n"
-            "    ▸ **命令**: `🦌日历`\n"
-            "    ▸ **作用**: 查看您本月的打卡日历，不记录打卡。\n\n"
-            "3️⃣  **查看年度记录**\n"
-            "    ▸ **命令**: `🦌年历`\n"
-            "    ▸ **作用**: 查看您本年度的完整打卡日历，不记录打卡。\n\n"
-            "4️⃣  **查看指定月份记录**\n"
-            "    ▸ **命令**: `🦌月历 月份数字`\n"
-            "    ▸ **作用**: 查看指定月份的打卡日历，不记录打卡。\n"
-            "    ▸ **示例**: `🦌月历 11` (查看11月的日历)\n\n"
-            "5️⃣  **打卡分析**\n"
-            "    ▸ **命令**: `🦌报告 [月份/年份]`\n"
-            "    ▸ **作用**: 分析您的打卡数据并生成报告。\n"
-            "    ▸ **示例**: `🦌报告` (本月分析)、`🦌报告 11` (11月分析)、`🦌报告 2025` (2025年分析)\n\n"
-            "6️⃣  **补签**\n"
-            "    ▸ **命令**: `🦌补签 [日期] [次数]`\n"
-            "    ▸ **作用**: 为本月指定日期补上打卡记录。\n"
-            "    ▸ **示例**: `🦌补签 1 5` (为本月1号补签5次)\n\n"
-            "7️⃣  **显示此帮助**\n"
-            "    ▸ **命令**: `🦌帮助`\n\n"
+            "1️⃣  🦌打卡\n"
+            "    ▸ 命令: 直接发送 🦌 (可发送多个)\n"
+            "    ▸ 作用: 记录今天🦌的数量。\n"
+            "    ▸ 示例: 🦌🦌🦌\n\n"
+            "2️⃣  查看记录\n"
+            "    ▸ 命令: 🦌日历\n"
+            "    ▸ 作用: 查看您本月的打卡日历，不记录打卡。\n\n"
+            "3️⃣  查看年度记录\n"
+            "    ▸ 命令: 🦌年历 [年份]\n"
+            "    ▸ 作用: 查看完整打卡日历。不带年份默认查看今年。\n"
+            "    ▸ 示例: 🦌年历 2024\n\n"
+            "4️⃣  查看生涯分析\n"
+            "    ▸ 命令: 🦌生涯\n"
+            "    ▸ 作用: 查看您的生涯统计、称号、最长记录等。\n\n"
+            "5️⃣  查看指定月份记录\n"
+            "    ▸ 命令: 🦌月历 月份数字\n"
+            "    ▸ 作用: 查看指定月份的打卡日历，不记录打卡。\n"
+            "    ▸ 示例: 🦌月历 11 (查看11月的日历)\n\n"
+            "6️⃣  打卡分析\n"
+            "    ▸ 命令: 🦌报告 [月份/年份]\n"
+            "    ▸ 作用: 分析您的打卡数据并生成报告。\n"
+            "    ▸ 示例: 🦌报告 (本月分析)、🦌报告 11 (11月分析)、🦌报告 2025 (2025年分析)\n\n"
+            "7️⃣  补签\n"
+            "    ▸ 命令: 🦌补签 [日期] [次数]\n"
+            "    ▸ 作用: 为本月指定日期补上打卡记录。\n"
+            "    ▸ 示例: 🦌补签 1 5 (为本月1号补签5次)，🦌补签 1 (为本月1号补签1次)\n\n"
+            "8️⃣  撤销\n"
+            "    ▸ 命令: 🦌撤销 [日期] [次数]\n"
+            "    ▸ 作用: 为本月指定日期减少打卡记录。\n"
+            "    ▸ 示例: 🦌撤销 1 5 (为本月1号减少5次)，🦌撤销 1 (为本月1号减少1次)\n\n"
+            "9️⃣  显示此帮助\n"
+            "    ▸ 命令: 🦌帮助\n\n"
             "祝您一🦌顺畅！"
         )
 
@@ -1403,7 +1774,7 @@ class DeerCheckinPlugin(Star):
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
-        # Use the deer_core method
+        # 使用 deer_core 方法
         result_text, image_path, has_error = await self.deer_core._generate_and_send_calendar(
             event, user_id, user_name, self.deer_db_path
         )
@@ -1416,11 +1787,11 @@ class DeerCheckinPlugin(Star):
         if image_path:
             yield event.image_result(image_path)
         else:
-            # If there's no image path and no error, it means there's no data
-            if not result_text:  # Only show default message if no custom result was provided
+            # 如果没有图片路径且没有错误，表示没有数据
+            if not result_text:  # 仅当没有提供自定义结果时显示默认消息
                 yield event.plain_result("您本月还没有打卡记录哦，发送“🦌”开始第一次打卡吧！")
 
-        # Clean up the image file
+        # 删除临时图片文件
         if image_path and os.path.exists(image_path):
             try:
                 await asyncio.to_thread(os.remove, image_path)

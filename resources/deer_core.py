@@ -215,11 +215,11 @@ class DeerCore:
         checkin_rate = total_days / analysis_days if analysis_days > 0 else 0
         freq_per_day = total_deer / analysis_days if analysis_days > 0 else 0
 
-        # 纯文字幽默报告 - start with just the stats, no title since it's in the image
+        # 纯文字幽默报告 - 仅以统计数据开始，无需标题（已在图片中）
         report = f"本月你一共动手 {total_days} 天，总计发射 {total_deer} 次。\n"
 
         if max_day_count == 1:
-            report += f"每日节奏：温柔单发，优雅从容。\n"  # 或直接跳过：pass
+            report += f"每日节奏：温柔单发，优雅从容。\n"  # 或直接跳过
         else:
             if max_day_count >= 3:
                 report += f"单日巅峰：{max_day_num}日 当天狂飙 {max_day_count} 次，手速已达职业级别，建议报名电竞。\n"
@@ -373,8 +373,11 @@ class DeerCore:
 
         # 显示从1月到当前月份（未来月份不显示）
         from datetime import datetime
-        current_month = datetime.now().month
-        months_to_show = current_month  # 显示1月到当前月份
+        current_date = datetime.now()
+        if year != current_date.year:
+            months_to_show = 12
+        else:
+            months_to_show = current_date.month
 
         # 定义每行显示的月份数量
         months_per_row = 3
@@ -483,7 +486,9 @@ class DeerCore:
         total_months = len(yearly_data)
         total_days = sum(len(days) for days in yearly_data.values())
         total_deer = sum(sum(days.values()) for days in yearly_data.values())
-        summary_text = f"年度总结：{year}年累计打卡{total_months}个月，{total_days}天，共{total_deer}次"
+
+        summary_prefix = "本年总结" if year == datetime.now().year else "年度总结"
+        summary_text = f"{summary_prefix}：{year}年累计打卡{total_months}个月，{total_days}天，共{total_deer}次"
         draw.text((img_width / 2, img_height - 20), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
 
         file_path = os.path.join(self.temp_dir, f"yearly_calendar_{user_id}_{int(time.time())}.png")
@@ -566,6 +571,151 @@ class DeerCore:
 
         file_path = os.path.join(self.temp_dir, f"checkin_{user_id}_{int(time.time())}.png")
         img.save(file_path, format='PNG')
+        return file_path
+
+    def _create_career_image(self, user_name: str, stats: dict) -> str:
+        """
+        绘制生涯报告图片
+        stats 包含: first_date_str, total_span_days, total_count, total_days, daily_avg,
+                    active_ratio, max_day_date, max_day_count, max_month_str, max_month_count,
+                    min_month_str, min_month_count, rest_period_str, sage_comment,
+                    status_day, status_comment, summary_comment
+        """
+        WIDTH = 800
+        # 计算高度：头部 + 5个板块 + 底部留白
+        # 板块内容增加，适当增高
+        HEIGHT = 1100
+        
+        BG_COLOR = (255, 255, 255)
+        TITLE_COLOR = (50, 50, 50)
+        SUBTITLE_COLOR = (100, 100, 100)
+        TEXT_COLOR = (80, 80, 80)
+        HIGHLIGHT_COLOR = (139, 69, 19)  # 鹿的颜色
+        SECTION_BG_COLOR = (248, 248, 255)
+        COMMENT_COLOR = (120, 120, 120) # 评语颜色
+        
+        img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+        
+        try:
+            font_title = ImageFont.truetype(self.font_path, 40)
+            font_subtitle = ImageFont.truetype(self.font_path, 24)
+            font_section_title = ImageFont.truetype(self.font_path, 28)
+            font_text = ImageFont.truetype(self.font_path, 24)
+            font_small = ImageFont.truetype(self.font_path, 20)
+            font_comment = ImageFont.truetype(self.font_path, 20) # 评语字体
+        except Exception:
+            # Fallback if font fails
+            font_title = ImageFont.load_default()
+            font_subtitle = ImageFont.load_default()
+            font_section_title = ImageFont.load_default()
+            font_text = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+            font_comment = ImageFont.load_default()
+
+        # 1. 标题区域
+        y_pos = 50
+        draw.text((WIDTH / 2, y_pos), "鹿生涯档案", font=font_title, fill=TITLE_COLOR, anchor="mm")
+        y_pos += 50
+        draw.text((WIDTH / 2, y_pos), f"选手：{user_name}", font=font_subtitle, fill=SUBTITLE_COLOR, anchor="mm")
+        
+        # 顶部总评
+        y_pos += 40
+        draw.text((WIDTH / 2, y_pos), f"“{stats['summary_comment']}”", font=font_section_title, fill=HIGHLIGHT_COLOR, anchor="mm")
+        
+        y_pos += 60
+
+        # 定义板块绘制函数
+        def draw_section(title, lines, start_y):
+            # 预计算行高
+            content_height = 0
+            processed_lines = [] # list of (text, font, color)
+            
+            for item in lines:
+                text = item['text']
+                is_comment = item.get('is_comment', False)
+                font = font_comment if is_comment else font_text
+                color = COMMENT_COLOR if is_comment else TEXT_COLOR
+                offset = 30 if is_comment else 35
+                processed_lines.append((text, font, color, offset))
+                content_height += offset
+            
+            # 绘制板块背景
+            section_height = 40 + content_height + 20
+            draw.rectangle(
+                [40, start_y, WIDTH - 40, start_y + section_height],
+                fill=SECTION_BG_COLOR,
+                outline=(230, 230, 230),
+                width=1
+            )
+            
+            # 绘制板块标题
+            current_y = start_y + 25
+            draw.text((60, current_y), title, font=font_section_title, fill=HIGHLIGHT_COLOR, anchor="lm")
+            
+            # 绘制内容
+            current_y += 40
+            for text, font, color, offset in processed_lines:
+                draw.text((80, current_y), text, font=font, fill=color, anchor="lm")
+                current_y += offset
+            
+            return start_y + section_height + 30
+
+        # 2. 生涯起点
+        lines = [
+            {'text': f"{stats['first_date_str']} (距今 {stats['total_span_days']} 天)"}
+        ]
+        y_pos = draw_section("生涯起点", lines, y_pos)
+
+        # 3. 累计战绩
+        avg_display = ""
+        if stats['daily_avg'] > 1:
+            avg_display = f"日均发射：{stats['daily_avg']:.2f} 次"
+        elif stats['daily_avg'] > 0:
+            interval = 1 / stats['daily_avg']
+            avg_display = f"平均频率：每 {interval:.1f} 天 1 次"
+        else:
+            avg_display = "日均发射：0 次"
+
+        lines = [
+            {'text': f"总计发射：{stats['total_count']} 次"},
+            {'text': f"动手天数：{stats['total_days']} 天 (占比 {stats['active_ratio']:.1f}%)"},
+            {'text': avg_display}
+        ]
+        y_pos = draw_section("累计战绩", lines, y_pos)
+
+        # 4. 巅峰时刻
+        lines = []
+        if stats['max_day_count'] > 1:
+            lines.append({'text': f"单日之最：{stats['max_day_date']} ({stats['max_day_count']} 次)"})
+        
+        if stats['max_month_count'] > 0:
+            lines.append({'text': f"月度之最：{stats['max_month_str']} ({stats['max_month_count']} 次)"})
+             
+        y_pos = draw_section("巅峰时刻", lines, y_pos)
+
+        # 5. 贤者时期
+        lines = [
+            {'text': f"最少月份：{stats['min_month_str']} ({stats['min_month_count']} 次)"},
+            {'text': f"最长休养：{stats['rest_period_str']}"}
+        ]
+        if stats['sage_comment']:
+             lines.append({'text': f"({stats['sage_comment']})", 'is_comment': True})
+             
+        y_pos = draw_section("贤者时期", lines, y_pos)
+
+        # 6. 当前状态
+        lines = [
+            {'text': f"距离上次：Day {stats['status_day']}"}
+        ]
+        if stats['status_comment']:
+            lines.append({'text': f"({stats['status_comment']})", 'is_comment': True})
+            
+        y_pos = draw_section("当前状态", lines, y_pos)
+
+        # 保存图片
+        file_path = os.path.join(self.temp_dir, f"career_{int(time.time())}.png")
+        img.save(file_path)
         return file_path
 
     async def _generate_and_send_calendar(self, event, user_id: str, user_name: str, db_path: str):

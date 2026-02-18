@@ -109,8 +109,11 @@ class KlittraCore:
 
         # 显示从1月到当前月份（未来月份不显示）
         from datetime import datetime
-        current_month = datetime.now().month
-        months_to_show = current_month  # 显示1月到当前月份
+        current_date = datetime.now()
+        if year != current_date.year:
+            months_to_show = 12
+        else:
+            months_to_show = current_date.month
 
         # 定义每行显示的月份数量
         months_per_row = 3
@@ -219,7 +222,9 @@ class KlittraCore:
         total_months = len(yearly_data)
         total_days = sum(len(days) for days in yearly_data.values())
         total_deer = sum(sum(days.values()) for days in yearly_data.values())
-        summary_text = f"年度总结：{year}年累计扣了{total_months}个月，{total_days}天，共{total_deer}次"
+
+        summary_prefix = "本年总结" if year == datetime.now().year else "年度总结"
+        summary_text = f"{summary_prefix}：{year}年累计扣了{total_months}个月，{total_days}天，共{total_deer}次"
         draw.text((img_width / 2, img_height - 20), summary_text, font=font_summary, fill=HEADER_COLOR, anchor="mm")
 
         file_path = os.path.join(self.temp_dir, f"klittra_yearly_calendar_{user_id}_{int(time.time())}.png")
