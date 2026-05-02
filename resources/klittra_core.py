@@ -5,10 +5,9 @@ Klittra功能模块
 
 import aiosqlite
 import calendar
-from datetime import date, datetime, timedelta
+from datetime import date
 from PIL import Image, ImageDraw, ImageFont
 import os
-import re
 import time
 import asyncio
 from astrbot.api import logger
@@ -231,11 +230,16 @@ class KlittraCore:
         img.save(file_path, format='PNG')
         return file_path
 
-    async def _generate_and_send_klittra_calendar(self, event, user_id: str, user_name: str, db_path: str):
+    async def _generate_and_send_klittra_calendar(self, event, user_id: str, user_name: str, db_path: str, adjusted_date_str: str = None):
         """查询和生成当月的扣日历。"""
-        current_year = date.today().year
-        current_month = date.today().month
-        current_month_str = date.today().strftime("%Y-%m")
+        if adjusted_date_str:
+            current_year = int(adjusted_date_str[:4])
+            current_month = int(adjusted_date_str[5:7])
+            current_month_str = adjusted_date_str[:7]
+        else:
+            current_year = date.today().year
+            current_month = date.today().month
+            current_month_str = date.today().strftime("%Y-%m")
 
         checkin_records = {}
         total_klittra_this_month = 0

@@ -1,11 +1,17 @@
-# 🦌打卡日历插件
+<div align="center">
+
+# 🦌打卡日历
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
 ![AstrBot](https://img.shields.io/badge/framework-AstrBot-ff6b6b?style=flat-square)
 
+</div>
+
 一款为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 框架设计的趣味打卡插件。
 
 用户通过发送 **单个或多个** “🦌” 表情进行每日打卡，插件会自动记录并生成一份简洁的个人月度打卡日历图，是你健康生活的好帮手（不是
+
+---
 
 ## ✨ 功能特性
 
@@ -21,6 +27,8 @@
 - **自动数据管理**：每月初会自动清理过往月份的打卡数据，保持数据库轻量，迎接新的一月。
 - 除了  `🦌` 功能外，本插件还支持 `🤏` 功能，其功能与 `🦌` 类似，包括日历、年历、排行等，但不包含报告功能。
 
+---
+
 ## 🚀 安装与配置
 
 **1. 安装插件**
@@ -32,6 +40,8 @@
 - 安装后，插件即加载。
 - 插件首次运行时会自动在目录下创建一个 `tmp` 文件夹用于存放临时图片。
 - 数据库路径 `data/plugin_data/astrbot_plugin_deer_check/deer_checkin.db`
+
+---
 
 ## 🎮 命令列表
 
@@ -89,6 +99,8 @@
     - `🦌撤销 1` (默认撤销1次)
   - **功能**: 撤销当月中某天的`🦌`数。
   - **回复**: 一张撤销后的本月打卡日历图。
+
+---
 
 ## ❤️ 支持
 
