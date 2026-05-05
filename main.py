@@ -3,7 +3,6 @@ import calendar
 from datetime import date, datetime, timedelta
 import os
 import re
-import time
 import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -17,12 +16,6 @@ DEER_DB_NAME = "deer_checkin.db"
 KLITTRA_DB_NAME = "klittra_checkin.db"
 
 
-@register(
-    "astrbot_plugin_deer_check",
-    "DITF16&Foolllll",
-    "一个发送'🦌'表情进行打卡并生成月度日历的插件",
-    "1.5"
-)
 class DeerCheckinPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -118,7 +111,9 @@ class DeerCheckinPlugin(Star):
 
     async def _monthly_cleanup(self):
         """检查是否进入新月份，如果是则清空旧数据（根据配置决定）"""
-        current_month = date.today().strftime("%Y-%m")
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        current_month = adjusted_date_str[:7]  # YYYY-MM format
         try:
             # 清理鹿打卡数据库
             async with aiosqlite.connect(self.deer_db_path) as conn:
@@ -231,7 +226,7 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result("打卡失败，数据库出错了 >_<")
             return
 
-        async for result in self._generate_and_send_calendar(event):
+        async for result in self._generate_and_send_calendar(event, today_str):
             yield result
 
     @filter.regex(r'^🤏+$')
@@ -322,7 +317,7 @@ class DeerCheckinPlugin(Star):
         user_name = event.get_sender_name()
 
         result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
-            event, user_id, user_name, self.klittra_db_path
+            event, user_id, user_name, self.klittra_db_path, today_str
         )
 
         if result_text:
@@ -358,7 +353,9 @@ class DeerCheckinPlugin(Star):
         user_name = event.get_sender_name()
         logger.info(f"用户 {user_name} ({event.get_sender_id()}) 使用命令查询日历。")
 
-        async for result in self._generate_and_send_calendar(event):
+        current_time = datetime.now()
+        today_str = self._get_adjusted_date(current_time)
+        async for result in self._generate_and_send_calendar(event, today_str):
             yield result
 
     @filter.regex(r'^🤏日历$')
@@ -380,9 +377,11 @@ class DeerCheckinPlugin(Star):
 
         await self._ensure_initialized()
         user_name = event.get_sender_name()
-        current_year = date.today().year
-        current_month = date.today().month
-        current_month_str = date.today().strftime("%Y-%m")
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        current_year = int(adjusted_date_str[:4])
+        current_month = int(adjusted_date_str[5:7])
+        current_month_str = adjusted_date_str[:7]
 
         checkin_records = {}
         total_deer_this_month = 0
@@ -474,9 +473,11 @@ class DeerCheckinPlugin(Star):
             return
 
         # 验证日期有效性
-        today = date.today()
-        current_year = today.year
-        current_month = today.month
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        adjusted_date = datetime.strptime(adjusted_date_str, "%Y-%m-%d").date()
+        current_year = adjusted_date.year
+        current_month = adjusted_date.month
 
         days_in_month = calendar.monthrange(current_year, current_month)[1]
 
@@ -484,7 +485,7 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
             return
 
-        if day_to_checkin > today.day:
+        if day_to_checkin > adjusted_date.day:
             yield event.plain_result("抱歉，不能对未来进行补签哦！")
             return
 
@@ -553,7 +554,9 @@ class DeerCheckinPlugin(Star):
 
         # 发送成功提示，并返回更新后的日历图片
         yield event.plain_result(f"补签成功！已为 {current_month}月{day_to_checkin}日 增加了 {deer_count} 个鹿。")
-        async for result in self._generate_and_send_calendar(event):
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        async for result in self._generate_and_send_calendar(event, adjusted_date_str):
             yield result
 
     @filter.regex(r'^🦌撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$')
@@ -596,9 +599,11 @@ class DeerCheckinPlugin(Star):
             return
 
         # 验证日期有效性
-        today = date.today()
-        current_year = today.year
-        current_month = today.month
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        adjusted_date = datetime.strptime(adjusted_date_str, "%Y-%m-%d").date()
+        current_year = adjusted_date.year
+        current_month = adjusted_date.month
 
         days_in_month = calendar.monthrange(current_year, current_month)[1]
 
@@ -606,7 +611,7 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
             return
 
-        if day_to_checkin > today.day:
+        if day_to_checkin > adjusted_date.day:
             yield event.plain_result("抱歉，不能对未来进行撤销哦！")
             return
 
@@ -641,7 +646,9 @@ class DeerCheckinPlugin(Star):
 
         # 发送成功提示，并返回更新后的日历图片
         yield event.plain_result(f"撤销成功！已为 {current_month}月{day_to_checkin}日 减少了 {deer_count} 个鹿。")
-        async for result in self._generate_and_send_calendar(event):
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        async for result in self._generate_and_send_calendar(event, adjusted_date_str):
             yield result
 
     @filter.regex(r'^🦌生涯$')
@@ -931,9 +938,11 @@ class DeerCheckinPlugin(Star):
             return  # 黑名单用户不处理
 
         await self._ensure_initialized()
-        current_year = date.today().year
-        current_month = date.today().month
-        current_month_str = date.today().strftime("%Y-%m")
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        current_year = int(adjusted_date_str[:4])
+        current_month = int(adjusted_date_str[5:7])
+        current_month_str = adjusted_date_str[:7]
 
         logger.info(f"开始查询群 {group_id} 的 {current_month_str} 月排行榜数据")
 
@@ -1565,9 +1574,11 @@ class DeerCheckinPlugin(Star):
             return  # 黑名单用户不处理
 
         await self._ensure_initialized()
-        current_year = date.today().year
-        current_month = date.today().month
-        current_month_str = date.today().strftime("%Y-%m")
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        current_year = int(adjusted_date_str[:4])
+        current_month = int(adjusted_date_str[5:7])
+        current_month_str = adjusted_date_str[:7]
 
         logger.info(f"开始查询群 {group_id} 的 {current_month_str} 月扣日历排行榜数据")
 
@@ -1769,14 +1780,14 @@ class DeerCheckinPlugin(Star):
         """
         return self.deer_core._create_calendar_image(user_id, user_name, year, month, checkin_data, total_deer)
 
-    async def _generate_and_send_calendar(self, event: AstrMessageEvent):
+    async def _generate_and_send_calendar(self, event: AstrMessageEvent, adjusted_date_str: str = None):
         """查询和生成当月的打卡日历。"""
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
         # 使用 deer_core 方法
         result_text, image_path, has_error = await self.deer_core._generate_and_send_calendar(
-            event, user_id, user_name, self.deer_db_path
+            event, user_id, user_name, self.deer_db_path, adjusted_date_str
         )
 
         if result_text:

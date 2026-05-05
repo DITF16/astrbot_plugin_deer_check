@@ -1,6 +1,6 @@
 name: astrbot_plugin_deer_check
 display_name: 🦌打卡日历
 description: "一个发送'🦌'进行打卡并生成日历的插件"
-version: v1.5
+version: v1.5.1
 author: DITF16&Foolllll
 repo: https://github.com/DITF16/astrbot_plugin_deer_check
