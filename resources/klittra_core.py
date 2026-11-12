@@ -29,6 +29,7 @@ class KlittraCore:
         month: int,
         checkin_data: dict,
         total_deer: int,
+        today: date = None,
     ) -> str:
         """
         绘制用户月度扣日历图片
@@ -79,9 +80,10 @@ class KlittraCore:
         cal = calendar.monthcalendar(year, month)
         y_offset = 120
         cell_height = 75
+        today_date = today or date.today()
         today_num = (
-            date.today().day
-            if date.today().year == year and date.today().month == month
+            today_date.day
+            if today_date.year == year and today_date.month == month
             else 0
         )
 
@@ -143,18 +145,22 @@ class KlittraCore:
         return file_path
 
     def _create_klittra_yearly_calendar_image(
-        self, user_id: str, user_name: str, year: int, yearly_data: dict
+        self,
+        user_id: str,
+        user_name: str,
+        year: int,
+        yearly_data: dict,
+        today: date = None,
     ) -> str:
         """
         绘制年度扣日历图片，将12个月的日历按网格排列
         """
-        from datetime import date
         import calendar
 
-        # 显示从1月到当前月份（未来月份不显示）
-        from datetime import datetime
+        # 未传入 today 时回退自然日
+        current_date = today or date.today()
 
-        current_date = datetime.now()
+        # 显示从1月到当前月份（未来月份不显示）
         if year != current_date.year:
             months_to_show = 12
         else:
@@ -245,7 +251,6 @@ class KlittraCore:
 
             # 绘制日期
             cal = calendar.monthcalendar(year, month)
-            current_date = date.today()
             today_num = (
                 current_date.day
                 if current_date.year == year and current_date.month == month
@@ -301,7 +306,7 @@ class KlittraCore:
         total_days = sum(len(days) for days in yearly_data.values())
         total_deer = sum(sum(days.values()) for days in yearly_data.values())
 
-        summary_prefix = "本年总结" if year == datetime.now().year else "年度总结"
+        summary_prefix = "本年总结" if year == current_date.year else "年度总结"
         summary_text = f"{summary_prefix}：{year}年累计扣了{total_months}个月，{total_days}天，共{total_deer}次"
         draw.text(
             (img_width / 2, img_height - 20),
@@ -324,16 +329,21 @@ class KlittraCore:
         user_name: str,
         db_path: str,
         adjusted_date_str: str = None,
+        today: date = None,
     ):
-        """查询和生成当月的扣日历。"""
+        """查询和生成当月的扣日历。
+
+        adjusted_date_str 定位要绘制的月份，today 为逻辑日，决定高亮哪一天，两者不可互替。
+        """
+        today_date = today or date.today()
         if adjusted_date_str:
             current_year = int(adjusted_date_str[:4])
             current_month = int(adjusted_date_str[5:7])
             current_month_str = adjusted_date_str[:7]
         else:
-            current_year = date.today().year
-            current_month = date.today().month
-            current_month_str = date.today().strftime("%Y-%m")
+            current_year = today_date.year
+            current_month = today_date.month
+            current_month_str = today_date.strftime("%Y-%m")
 
         checkin_records = {}
         total_klittra_this_month = 0
@@ -370,6 +380,7 @@ class KlittraCore:
                 current_month,
                 checkin_records,
                 total_klittra_this_month,
+                today_date,
             )
             return None, image_path, False
         except FileNotFoundError:

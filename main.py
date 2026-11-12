@@ -2,6 +2,7 @@ import aiosqlite
 import calendar
 from datetime import date, datetime, timedelta
 import os
+import random
 import re
 import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
@@ -55,6 +56,10 @@ class DeerCheckinPlugin(Star):
 
         self._initialized = False
         self._init_lock = asyncio.Lock()
+
+        # 「🦌不🦌」结果缓存：user_id -> (参数签名, 结论)
+        self._oracle_cache = {}
+        self._oracle_day = ""
 
     async def _ensure_initialized(self):
         """确保数据库和月度清理只在首次调用时异步执行一次"""
@@ -127,6 +132,12 @@ class DeerCheckinPlugin(Star):
             adjusted_date = current_time
         return adjusted_date.strftime("%Y-%m-%d")
 
+    def _get_adjusted_date_obj(self) -> date:
+        """返回当前逻辑日对应的 date 对象。"""
+        return datetime.strptime(
+            self._get_adjusted_date(datetime.now()), "%Y-%m-%d"
+        ).date()
+
     def _parse_period_param(self, param: str) -> tuple:
         """
         解析月份/年份参数（🦌报告/🦌排行/🦌日历 共用）。
@@ -135,8 +146,10 @@ class DeerCheckinPlugin(Star):
           kind == 'year'  → 目标年份，month 为 0
           kind == None    → 参数非法，err_msg 为可直接发送的提示
         """
-        current_year = datetime.now().year
-        current_month = datetime.now().month
+        # 以逻辑日判断当前年月，跨天点后仍归属前一逻辑日
+        current_date = self._get_adjusted_date_obj()
+        current_year = current_date.year
+        current_month = current_date.month
         if len(param) == 4:
             try:
                 target_year = int(param)
@@ -159,7 +172,7 @@ class DeerCheckinPlugin(Star):
 
     def _period_name(self, is_month: bool, year: int, month: int) -> str:
         """返回周期的展示文案：当前月/今年用'本月'/'今年'，否则用具体的'X年X月'/'X年'。"""
-        now = datetime.now()
+        now = self._get_adjusted_date_obj()
         if is_month:
             if year == now.year and month == now.month:
                 return "本月"
@@ -355,6 +368,142 @@ class DeerCheckinPlugin(Star):
         async for result in self._generate_and_send_calendar(event, today_str):
             yield result
 
+    def _oracle_factors(
+        self, rows: list, today_str: str, current_time: datetime
+    ) -> tuple:
+        """计算「🦌不🦌」的偏向概率，并返回决定该概率的参数签名。
+
+        概率由四项偏移叠加在 50% 基准上得出，历史相关项按可信度衰减。
+        签名取自参与计算的原始整数，完整决定概率，可用于判断是否复用上次结果。
+        """
+        today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+
+        n_today = 0
+        for date_str, count in rows:
+            if date_str == today_str:
+                n_today = count
+                break
+
+        total_days = len(rows)
+        if total_days:
+            first_date = datetime.strptime(rows[0][0], "%Y-%m-%d").date()
+            total_span_days = (today_date - first_date).days + 1
+        else:
+            total_span_days = 1
+
+        # Δ1 今日次数：已打卡则降低概率
+        d1 = -0.05 * min(n_today, 3)
+
+        # Δ2 间隔节奏：按个人平均间隔归一化，常规窗口内取峰值
+        avg_gap = max(1.0, total_span_days / total_days) if total_days else 1.0
+
+        if n_today > 0:
+            status_day = 0
+        elif rows:
+            last_date = datetime.strptime(rows[-1][0], "%Y-%m-%d").date()
+            status_day = max(0, (today_date - last_date).days)
+        else:
+            status_day = None
+
+        if status_day is None:
+            d2 = 0.0
+        else:
+            ratio = status_day / avg_gap
+            if ratio <= 1.4:
+                d2 = max(-0.28, min(0.19, -0.28 + (ratio - 0.3) * 0.85))
+            else:
+                d2 = max(0.0, 0.19 - (ratio - 1.4) * 0.24)
+
+        # Δ3 当前时段：取真实钟点，与逻辑日无关
+        hour = current_time.hour
+        if hour <= 3:
+            hour_bucket, d3 = 0, 0.09
+        elif hour <= 8:
+            hour_bucket, d3 = 1, -0.05
+        elif hour >= 22:
+            hour_bucket, d3 = 3, 0.04
+        else:
+            hour_bucket, d3 = 2, 0.0
+
+        # Δ4 生涯活跃度：长期高频则降低概率
+        active_ratio = total_days / total_span_days if total_span_days else 0.0
+        if active_ratio >= 0.8:
+            d4 = -0.04
+        elif active_ratio >= 0.5:
+            d4 = -0.02
+        elif active_ratio <= 0.2:
+            d4 = 0.05
+        else:
+            d4 = 0.0
+
+        # 历史项按打卡天数衰减，新用户趋近纯随机
+        cred = min(1.0, total_days / 10)
+
+        p = 0.5 + d1 + d3 + cred * (d2 + d4)
+        p = min(max(p, 0.12), 0.85)
+
+        logger.debug(
+            f"🦌不🦌 判定: n={n_today} status_day={status_day} "
+            f"avg_gap={avg_gap:.2f} p={p:.3f}"
+        )
+
+        signature = (
+            n_today,
+            -1 if status_day is None else status_day,
+            total_days,
+            total_span_days,
+            hour_bucket,
+        )
+        return p, signature
+
+    @filter.regex(r"^🦌不🦌$")
+    async def handle_oracle(self, event: AstrMessageEvent):
+        """响应 '🦌不🦌'：给出娱乐性参考结论，参数签名相同则复用上次结果。"""
+        guarded = await self._guard(event)
+        if not guarded:
+            return
+        _, user_id = guarded
+
+        current_time = datetime.now()
+        today_str = self._get_adjusted_date(current_time)
+
+        # 跨逻辑日清空缓存，仅用于回收旧条目
+        if self._oracle_day != today_str:
+            self._oracle_cache.clear()
+            self._oracle_day = today_str
+
+        try:
+            async with aiosqlite.connect(self.deer_db_path) as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT checkin_date, deer_count FROM checkin
+                    WHERE user_id = ? ORDER BY checkin_date ASC
+                    """,
+                    (user_id,),
+                )
+                rows = await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"用户 {user_id} 的🦌不🦌判定失败: {e}")
+            yield event.plain_result("判定失败，数据库出错了 >_<")
+            return
+
+        p, signature = self._oracle_factors(rows, today_str, current_time)
+
+        cached = self._oracle_cache.get(user_id)
+        if cached is not None and cached[0] == signature:
+            verdict = cached[1]
+        else:
+            rolled = 1 if random.random() < p else 0
+            # 读库期间可能已有并发请求写入同一签名，沿用先写入者
+            cached = self._oracle_cache.get(user_id)
+            if cached is not None and cached[0] == signature:
+                verdict = cached[1]
+            else:
+                self._oracle_cache[user_id] = (signature, rolled)
+                verdict = rolled
+
+        yield event.plain_result("🦌！" if verdict else "不🦌！")
+
     @filter.regex(rf"^(?:{KLITTRA_EMOJI_RE})+$")
     async def handle_klittra_checkin(self, event: AstrMessageEvent):
         """处理扣日历记录事件：如果启用了扣日历功能，则记录数据并发送扣日历。"""
@@ -468,7 +617,12 @@ class DeerCheckinPlugin(Star):
             image_path,
             has_error,
         ) = await self.klittra_core._generate_and_send_klittra_calendar(
-            event, user_id, user_name, self.klittra_db_path, today_str
+            event,
+            user_id,
+            user_name,
+            self.klittra_db_path,
+            today_str,
+            datetime.strptime(today_str, "%Y-%m-%d").date(),
         )
 
         if result_text:
@@ -536,6 +690,7 @@ class DeerCheckinPlugin(Star):
         current_year = int(adjusted_date_str[:4])
         current_month = int(adjusted_date_str[5:7])
         current_month_str = adjusted_date_str[:7]
+        today_date = datetime.strptime(adjusted_date_str, "%Y-%m-%d").date()
 
         checkin_records = {}
         total_deer_this_month = 0
@@ -572,6 +727,7 @@ class DeerCheckinPlugin(Star):
                 current_month,
                 checkin_records,
                 total_deer_this_month,
+                today_date,
             )
             yield event.image_result(image_path)
         except FileNotFoundError:
@@ -977,9 +1133,7 @@ class DeerCheckinPlugin(Star):
                 )
                 rows = await cursor.fetchall()
 
-            today_rows = [
-                (uid, cnt, ts) for d, uid, cnt, ts in rows if d == today_str
-            ]
+            today_rows = [(uid, cnt, ts) for d, uid, cnt, ts in rows if d == today_str]
             week_total = {}
             month_total = {}
             for d, uid, cnt, _ts in rows:
@@ -1167,9 +1321,7 @@ class DeerCheckinPlugin(Star):
                 max_month_str, max_month_count = full_month_data[0]
 
                 # 最少月份排除当前月（当月未结束，统计不完整）
-                min_candidates = [
-                    m for m in full_month_data if m[0] != today_str[:7]
-                ]
+                min_candidates = [m for m in full_month_data if m[0] != today_str[:7]]
                 if min_candidates:
                     min_candidates.sort(key=lambda x: x[1])  # 升序
                     min_month_str, min_month_count = min_candidates[
@@ -1187,9 +1339,7 @@ class DeerCheckinPlugin(Star):
             max_day_date, max_day_count = max(rows, key=lambda r: (r[1], r[0]))
 
             # 最长休养期 (连续未打卡)
-            date_objs = [
-                datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows
-            ]
+            date_objs = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
 
             max_gap = 0
             gap_start = None
@@ -1557,8 +1707,8 @@ class DeerCheckinPlugin(Star):
         param = match.group(1) if match and match.group(1) else None
 
         if param is None:
-            # 默认分析本月
-            current_date = datetime.now()
+            # 默认分析本月，以逻辑日为准
+            current_date = self._get_adjusted_date_obj()
             target_year = current_date.year
             target_month = current_date.month
             target_period = f"{target_year}年{target_month}月"
@@ -1656,7 +1806,8 @@ class DeerCheckinPlugin(Star):
         pattern = r"^🦌年历(?:\s+(\d{4}))?$"
         match = re.search(pattern, event.message_str)
 
-        current_year = datetime.now().year
+        today_date = self._get_adjusted_date_obj()
+        current_year = today_date.year
         if match and match.group(1):
             try:
                 current_year = int(match.group(1))
@@ -1708,6 +1859,7 @@ class DeerCheckinPlugin(Star):
                 user_name,
                 current_year,
                 yearly_data,
+                today_date,
             )
             yield event.image_result(image_path)
         except FileNotFoundError:
@@ -1749,7 +1901,8 @@ class DeerCheckinPlugin(Star):
         pattern = rf"^{KLITTRA_EMOJI_RE}年历(?:\s+(\d{{4}}))?$"
         match = re.search(pattern, event.message_str)
 
-        current_year = datetime.now().year
+        today_date = self._get_adjusted_date_obj()
+        current_year = today_date.year
         if match and match.group(1):
             try:
                 current_year = int(match.group(1))
@@ -1801,6 +1954,7 @@ class DeerCheckinPlugin(Star):
                 user_name,
                 current_year,
                 yearly_data,
+                today_date,
             )
             yield event.image_result(image_path)
         except FileNotFoundError:
@@ -1854,10 +2008,10 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result("请输入正确的月份数字！")
             return
 
-        # 计算年份：如果指定月份大于当前月份，则为去年
-        current_date = datetime.now()
-        current_month = current_date.month
-        current_year = current_date.year
+        # 指定月份大于当前月份则归入去年，以逻辑日为准
+        today_date = self._get_adjusted_date_obj()
+        current_month = today_date.month
+        current_year = today_date.year
 
         if target_month > current_month:
             target_year = current_year - 1
@@ -1910,6 +2064,7 @@ class DeerCheckinPlugin(Star):
                 target_month,
                 checkin_records,
                 total_deer_this_month,
+                today_date,
             )
             yield event.image_result(image_path)
         except FileNotFoundError:
@@ -2095,7 +2250,10 @@ class DeerCheckinPlugin(Star):
             "9️⃣  清空数据\n"
             "    ▸ 命令: 🦌清空\n"
             "    ▸ 作用: 清空您的全部鹿打卡数据，所有记录将被删除，无法恢复。\n\n"
-            "🔟  显示此帮助\n"
+            "🔟  今日一签\n"
+            "    ▸ 命令: 🦌不🦌\n"
+            "    ▸ 作用: 结合你的历史节奏给个娱乐性参考。\n\n"
+            "1️⃣1️⃣  显示此帮助\n"
             "    ▸ 命令: 🦌帮助\n"
         )
         if self.enable_female_calendar:
@@ -2134,11 +2292,15 @@ class DeerCheckinPlugin(Star):
         return await self.deer_core._get_user_yearly_data(user_id, year)
 
     async def _generate_monthly_analysis_report(
-        self, user_name: str, year: int, month: int, period_data: dict
+        self, user_name: str, year: int, month: int, period_data: dict, today=None
     ) -> tuple[str, float]:
         """生成月度趣味打卡分析报告"""
         return await self.deer_core._generate_monthly_analysis_report(
-            user_name, year, month, period_data
+            user_name,
+            year,
+            month,
+            period_data,
+            today or self._get_adjusted_date_obj(),
         )
 
     async def _generate_yearly_analysis_report(
@@ -2170,13 +2332,17 @@ class DeerCheckinPlugin(Star):
         return self.deer_core._wrap_text(text, font, max_width)
 
     def _create_yearly_calendar_image(
-        self, user_id: str, user_name: str, year: int, yearly_data: dict
+        self, user_id: str, user_name: str, year: int, yearly_data: dict, today=None
     ) -> str:
         """
         绘制年度打卡日历图片，将12个月的日历按网格排列
         """
         return self.deer_core._create_yearly_calendar_image(
-            user_id, user_name, year, yearly_data
+            user_id,
+            user_name,
+            year,
+            yearly_data,
+            today or self._get_adjusted_date_obj(),
         )
 
     def _create_calendar_image(
@@ -2187,12 +2353,19 @@ class DeerCheckinPlugin(Star):
         month: int,
         checkin_data: dict,
         total_deer: int,
+        today=None,
     ) -> str:
         """
         绘制用户月度打卡日历图片
         """
         return self.deer_core._create_calendar_image(
-            user_id, user_name, year, month, checkin_data, total_deer
+            user_id,
+            user_name,
+            year,
+            month,
+            checkin_data,
+            total_deer,
+            today or self._get_adjusted_date_obj(),
         )
 
     async def _generate_and_send_calendar(
@@ -2201,6 +2374,7 @@ class DeerCheckinPlugin(Star):
         """查询和生成当月的打卡日历。"""
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
+        today_date = self._get_adjusted_date_obj()
 
         # 使用 deer_core 方法
         (
@@ -2208,7 +2382,7 @@ class DeerCheckinPlugin(Star):
             image_path,
             has_error,
         ) = await self.deer_core._generate_and_send_calendar(
-            event, user_id, user_name, self.deer_db_path, adjusted_date_str
+            event, user_id, user_name, self.deer_db_path, adjusted_date_str, today_date
         )
 
         if result_text:
