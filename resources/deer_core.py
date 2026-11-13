@@ -401,9 +401,14 @@ class DeerCore:
         return yearly_data
 
     async def _generate_monthly_analysis_report(
-        self, user_name: str, year: int, month: int, period_data: dict
+        self,
+        user_name: str,
+        year: int,
+        month: int,
+        period_data: dict,
+        today: date = None,
     ) -> tuple[str, float]:
-        """生成月度趣味打卡分析报告"""
+        """生成月度趣味打卡分析报告（today 为逻辑日）"""
         if not period_data:
             return "", 0.0
 
@@ -429,7 +434,7 @@ class DeerCore:
 
         # 本月应分析天数 & 发射率
         days_in_month = calendar.monthrange(year, month)[1]
-        today = date.today()
+        today = today or date.today()
         analysis_days = (
             today.day if year == today.year and month == today.month else days_in_month
         )
@@ -636,18 +641,22 @@ class DeerCore:
         return truncated + ellipsis
 
     def _create_yearly_calendar_image(
-        self, user_id: str, user_name: str, year: int, yearly_data: dict
+        self,
+        user_id: str,
+        user_name: str,
+        year: int,
+        yearly_data: dict,
+        today: date = None,
     ) -> str:
         """
         绘制年度打卡日历图片，将12个月的日历按网格排列
         """
-        from datetime import date
         import calendar
 
-        # 显示从1月到当前月份（未来月份不显示）
-        from datetime import datetime
+        # 未传入 today 时回退自然日
+        current_date = today or date.today()
 
-        current_date = datetime.now()
+        # 显示从1月到当前月份（未来月份不显示）
         if year != current_date.year:
             months_to_show = 12
         else:
@@ -738,7 +747,6 @@ class DeerCore:
 
             # 绘制日期
             cal = calendar.monthcalendar(year, month)
-            current_date = date.today()
             today_num = (
                 current_date.day
                 if current_date.year == year and current_date.month == month
@@ -794,7 +802,7 @@ class DeerCore:
         total_days = sum(len(days) for days in yearly_data.values())
         total_deer = sum(sum(days.values()) for days in yearly_data.values())
 
-        summary_prefix = "本年总结" if year == datetime.now().year else "年度总结"
+        summary_prefix = "本年总结" if year == current_date.year else "年度总结"
         summary_text = f"{summary_prefix}：{year}年累计打卡{total_months}个月，{total_days}天，共{total_deer}次"
         draw.text(
             (img_width / 2, img_height - 20),
@@ -818,6 +826,7 @@ class DeerCore:
         month: int,
         checkin_data: dict,
         total_deer: int,
+        today: date = None,
     ) -> str:
         """
         绘制用户月度打卡日历图片
@@ -868,9 +877,10 @@ class DeerCore:
         cal = calendar.monthcalendar(year, month)
         y_offset = 120
         cell_height = 75
+        today_date = today or date.today()
         today_num = (
-            date.today().day
-            if date.today().year == year and date.today().month == month
+            today_date.day
+            if today_date.year == year and today_date.month == month
             else 0
         )
 
@@ -1123,16 +1133,21 @@ class DeerCore:
         user_name: str,
         db_path: str,
         adjusted_date_str: str = None,
+        today: date = None,
     ):
-        """查询和生成当月的打卡日历。"""
+        """查询和生成当月的打卡日历。
+
+        adjusted_date_str 定位要绘制的月份，today 为逻辑日，决定高亮哪一天，两者不可互替。
+        """
+        today_date = today or date.today()
         if adjusted_date_str:
             current_year = int(adjusted_date_str[:4])
             current_month = int(adjusted_date_str[5:7])
             current_month_str = adjusted_date_str[:7]
         else:
-            current_year = date.today().year
-            current_month = date.today().month
-            current_month_str = date.today().strftime("%Y-%m")
+            current_year = today_date.year
+            current_month = today_date.month
+            current_month_str = today_date.strftime("%Y-%m")
 
         checkin_records = {}
         total_deer_this_month = 0
@@ -1144,8 +1159,10 @@ class DeerCore:
                 ) as cursor:
                     rows = await cursor.fetchall()
                     if not rows:
-                        today = date.today()
-                        if current_year == today.year and current_month == today.month:
+                        if (
+                            current_year == today_date.year
+                            and current_month == today_date.month
+                        ):
                             msg = "您本月还没有打卡记录哦，发送“🦌”开始第一次打卡吧！"
                         else:
                             msg = f"您{current_year}年{current_month}月还没有打卡记录哦，发送“🦌”开始第一次打卡吧！"
@@ -1170,6 +1187,7 @@ class DeerCore:
                 current_month,
                 checkin_records,
                 total_deer_this_month,
+                today_date,
             )
             return None, image_path, False
         except FileNotFoundError:

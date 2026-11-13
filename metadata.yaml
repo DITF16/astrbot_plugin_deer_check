@@ -1,7 +1,7 @@
 name: astrbot_plugin_deer_check
 display_name: 🦌打卡日历
-desc: 一个发送'🦌'进行打卡并生成日历的插件，支持分析报告、排行榜与群打卡战报。
-version: v1.6.0
+desc: 一个发送'🦌'进行打卡并生成日历的插件，支持分析报告、排行榜、群打卡战报与今日一签。
+version: v1.7.0
 author: DITF16 & Foolllll
 repo: https://github.com/DITF16/astrbot_plugin_deer_check
 category: 生活
